@@ -12,6 +12,7 @@ from frappe import _
 from frappe.core.doctype.access_log.access_log import make_access_log
 from frappe.model.document import Document
 from frappe.translate import print_language
+from frappe.utils import cint
 from frappe.utils.jinja import render_template
 from frappe.utils.pdf import get_pdf
 
@@ -320,6 +321,66 @@ def render_letterhead_for_print(letterhead: str | None = None, doc: dict | str |
 		rendered["footer"] = footer
 
 	return rendered
+
+
+@frappe.whitelist()
+@frappe.read_only()
+def render_report_jinja(
+	report_name: str,
+	filters: str | dict | None = None,
+	print_format: str | None = None,
+	letterhead: str | None = None,
+	no_letterhead: bool | int = 0,
+) -> dict:
+	"""Render a Report print format authored in Jinja, server-side."""
+	from frappe.desk.query_report import run
+
+	if not print_format:
+		frappe.throw(_("Print Format is required"))
+
+	pf = frappe.db.get_value(
+		"Print Format",
+		print_format,
+		["print_format_for", "print_format_type", "report", "disabled", "html", "css"],
+		as_dict=True,
+	)
+	if not pf:
+		frappe.throw(_("Print Format {0} not found").format(print_format))
+	if pf.print_format_for != "Report" or pf.print_format_type != "Jinja" or pf.report != report_name:
+		frappe.throw(_("{0} is not a Jinja print format for report {1}").format(print_format, report_name))
+	if pf.disabled:
+		frappe.throw(_("Print Format {0} is disabled").format(print_format))
+	if not pf.html:
+		frappe.throw(_("Print Format {0} has no HTML body").format(print_format))
+
+	filters = frappe.parse_json(filters) if isinstance(filters, str) else (filters or {})
+
+	# run() enforces report + filter permissions and is prepared-report aware
+	result = run(report_name, filters)
+
+	# Wrap rows as _dict so templates can pass `row` to frappe.format_value safely.
+	data = [frappe._dict(row) if isinstance(row, dict) else row for row in (result.get("result") or [])]
+
+	context = {
+		"report": frappe._dict(name=report_name, report_name=report_name),
+		"filters": frappe._dict(filters),
+		"columns": result.get("columns") or [],
+		"data": data,
+		"no_letterhead": cint(no_letterhead),
+		"print_settings": frappe.get_single("Print Settings").as_dict(),
+	}
+
+	# CSS comes only from the format; print window provides boot.print_css baseline.
+	html = render_template(pf.html, context, safe_render=True)
+	style = pf.css or ""
+
+	letter_head = (
+		None
+		if cint(no_letterhead)
+		else (render_letterhead_for_print(letterhead=letterhead, doc=filters) or None)
+	)
+
+	return {"html": html, "style": style, "letter_head": letter_head}
 
 
 @frappe.whitelist()
