@@ -1613,11 +1613,9 @@ frappe.views.QueryReport = class QueryReport extends frappe.views.BaseList {
 			print_css: frappe.boot.print_css,
 			print_settings: print_settings,
 			landscape: print_settings.orientation == "Landscape",
-			columns: body.columns,
 			lang: frappe.boot.lang,
 			layout_direction: frappe.utils.is_rtl() ? "rtl" : "ltr",
-			can_use_smaller_font:
-				this.report_doc.is_standard === "Yes" && custom_format?.template ? 0 : 1,
+			can_use_smaller_font: body.can_use_smaller_font,
 		});
 
 		print_settings.report_name = this.get_pdf_filename();
@@ -1627,7 +1625,7 @@ frappe.views.QueryReport = class QueryReport extends frappe.views.BaseList {
 	async render_pdf_body_jinja(print_settings, print_format) {
 		const content = await this.render_report_jinja(print_settings, print_format);
 		if (content === null) return null;
-		return { content, columns: [] };
+		return { content, can_use_smaller_font: 0 };
 	}
 
 	async render_pdf_body_js(print_settings, custom_format) {
@@ -1645,7 +1643,15 @@ frappe.views.QueryReport = class QueryReport extends frappe.views.BaseList {
 			report: this,
 			print_settings: print_settings,
 		});
-		return { content, columns };
+		return {
+			content,
+			can_use_smaller_font: this.compute_smaller_font(custom_format, columns),
+		};
+	}
+
+	compute_smaller_font(custom_format, columns) {
+		const allow_shrink = !(this.report_doc.is_standard === "Yes" && custom_format?.template);
+		return allow_shrink && columns.length > 20 ? 1 : 0;
 	}
 
 	get_pdf_filename() {
@@ -1721,12 +1727,13 @@ frappe.views.QueryReport = class QueryReport extends frappe.views.BaseList {
 			content: content,
 			print_settings: print_settings,
 			landscape: print_settings.orientation == "Landscape",
-			columns: [],
 		});
 	}
 
 	async print_report_via_js(print_settings, custom_format) {
 		await this.render_report_letterhead(print_settings);
+
+		const columns = this.get_columns_for_print(print_settings, custom_format);
 
 		frappe.render_grid({
 			template: this.get_print_template(print_settings, custom_format),
@@ -1736,11 +1743,10 @@ frappe.views.QueryReport = class QueryReport extends frappe.views.BaseList {
 			landscape: print_settings.orientation == "Landscape",
 			filters: this.get_filter_values(),
 			data: this.get_data_for_print(),
-			columns: this.get_columns_for_print(print_settings, custom_format),
+			columns: columns,
 			original_data: this.data,
 			report: this,
-			can_use_smaller_font:
-				this.report_doc.is_standard === "Yes" && custom_format?.template ? 0 : 1,
+			can_use_smaller_font: this.compute_smaller_font(custom_format, columns),
 		});
 	}
 
