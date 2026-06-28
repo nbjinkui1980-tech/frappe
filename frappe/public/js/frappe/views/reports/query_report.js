@@ -1583,120 +1583,110 @@ frappe.views.QueryReport = class QueryReport extends frappe.views.BaseList {
 	}
 
 	async print_report(print_settings) {
-		const filters_html = this.get_filters_html_for_print();
-		const landscape = print_settings.orientation == "Landscape";
-
 		const custom_format = await this.get_custom_format(print_settings);
-
-		if (custom_format?.print_format_type === "Jinja" && custom_format.print_format) {
-			this.make_access_log("Print", "PDF");
-			return this.print_report_jinja(print_settings, custom_format.print_format);
-		}
-
-		await this.render_report_letterhead(print_settings);
 
 		this.make_access_log("Print", "PDF");
 
-		frappe.render_grid({
-			template: this.get_print_template(print_settings, custom_format),
-			title: __(this.report_name),
-			subtitle: print_settings?.include_filters ? filters_html : null,
-			print_settings: print_settings,
-			landscape: landscape,
-			filters: this.get_filter_values(),
-			data: this.get_data_for_print(),
-			columns: this.get_columns_for_print(print_settings, custom_format),
-			original_data: this.data,
-			report: this,
-			can_use_smaller_font:
-				this.report_doc.is_standard === "Yes" && custom_format?.template ? 0 : 1,
-		});
+		if (custom_format?.print_format_type === "Jinja" && custom_format.print_format) {
+			return this.print_report_via_jinja(print_settings, custom_format.print_format);
+		}
+
+		return this.print_report_via_js(print_settings, custom_format);
 	}
 
 	async pdf_report(print_settings) {
-		const base_url = frappe.urllib.get_base_url();
-		const print_css = frappe.boot.print_css;
-		const landscape = print_settings.orientation == "Landscape";
-
 		const custom_format = await this.get_custom_format(print_settings);
+		const is_jinja =
+			custom_format?.print_format_type === "Jinja" && custom_format.print_format;
 
-		await this.render_report_letterhead(print_settings);
+		this.make_access_log("Print", "PDF");
 
-		const columns = this.get_columns_for_print(print_settings, custom_format);
-		const data = this.get_data_for_print();
-		const applied_filters = this.get_filter_values();
-		const filters_html = this.get_filters_html_for_print();
-		const template = this.get_print_template(print_settings, custom_format);
-		const content = frappe.render_template(template, {
-			title: __(this.report_name),
-			subtitle: print_settings?.include_filters ? filters_html : null,
-			filters: applied_filters,
-			data: data,
-			original_data: this.data,
-			columns: columns,
-			report: this,
-			print_settings: print_settings,
-		});
+		const body = is_jinja
+			? await this.render_pdf_body_jinja(print_settings, custom_format.print_format)
+			: await this.render_pdf_body_js(print_settings, custom_format);
+		if (!body) return;
 
-		// Render Report in HTML
 		const html = frappe.render_template("print_template", {
 			title: __(this.report_name),
-			content: content,
-			base_url: base_url,
-			print_css: print_css,
+			content: body.content,
+			base_url: frappe.urllib.get_base_url(),
+			print_css: frappe.boot.print_css,
 			print_settings: print_settings,
-			landscape: landscape,
-			columns: columns,
+			landscape: print_settings.orientation == "Landscape",
+			columns: body.columns,
 			lang: frappe.boot.lang,
 			layout_direction: frappe.utils.is_rtl() ? "rtl" : "ltr",
 			can_use_smaller_font:
 				this.report_doc.is_standard === "Yes" && custom_format?.template ? 0 : 1,
 		});
 
-		let filter_values = [],
-			name_len = 0;
-		for (var key of Object.keys(applied_filters)) {
-			name_len = name_len + applied_filters[key].toString().length;
-			if (name_len > 200) break;
-			filter_values.push(applied_filters[key]);
-		}
-
-		if (filter_values.length) {
-			print_settings.report_name = `${__(this.report_name)}_${filter_values.join("_")}.pdf`;
-		} else {
-			print_settings.report_name = `${__(this.report_name)}.pdf`;
-		}
+		print_settings.report_name = this.get_pdf_filename();
 		frappe.render_pdf(html, print_settings);
 	}
 
-	async get_custom_format(print_settings) {
-		// Capture print_format synchronously; the dialog clears it after us.
-		let template = this.report_settings.html_format || null;
-		let print_format_type = "JS";
-		let print_format = null;
+	async render_pdf_body_jinja(print_settings, print_format) {
+		const content = await this.render_report_jinja(print_settings, print_format);
+		if (content === null) return null;
+		return { content, columns: [] };
+	}
 
+	async render_pdf_body_js(print_settings, custom_format) {
+		await this.render_report_letterhead(print_settings);
+
+		const columns = this.get_columns_for_print(print_settings, custom_format);
+		const template = this.get_print_template(print_settings, custom_format);
+		const content = frappe.render_template(template, {
+			title: __(this.report_name),
+			subtitle: print_settings?.include_filters ? this.get_filters_html_for_print() : null,
+			filters: this.get_filter_values(),
+			data: this.get_data_for_print(),
+			original_data: this.data,
+			columns: columns,
+			report: this,
+			print_settings: print_settings,
+		});
+		return { content, columns };
+	}
+
+	get_pdf_filename() {
+		const applied_filters = this.get_filter_values();
+		const filter_values = [];
+		let name_len = 0;
+		for (const key of Object.keys(applied_filters)) {
+			name_len += applied_filters[key].toString().length;
+			if (name_len > 200) break;
+			filter_values.push(applied_filters[key]);
+		}
+		return filter_values.length
+			? `${__(this.report_name)}_${filter_values.join("_")}.pdf`
+			: `${__(this.report_name)}.pdf`;
+	}
+
+	async get_custom_format(print_settings) {
 		const requested_format = print_settings.print_format || print_settings.report;
+		const bundled_template = this.report_settings.html_format || null;
 
 		if (requested_format) {
 			const fetched = await this.get_report_print_format(requested_format);
 			if (fetched) {
-				template = fetched.template;
-				print_format_type = fetched.print_format_type || "JS";
-				print_format = requested_format;
+				return {
+					template: fetched.template,
+					print_format_type: fetched.print_format_type || "JS",
+					print_format: requested_format,
+				};
 			}
-		} else if (
-			!print_settings.columns?.length &&
-			typeof this.report_settings.get_pdf_format === "function"
-		) {
-			template = await this.report_settings.get_pdf_format(this, template);
+			return { template: bundled_template, print_format_type: "JS", print_format: null };
 		}
 
-		return { template, print_format_type, print_format };
-	}
-
-	get_print_template(print_settings, custom_format) {
-		const template = custom_format?.template;
-		return print_settings.columns?.length || !template ? "print_grid" : template;
+		// No print format picked — use the bundled JS template, optionally overridden by
+		// the report module's get_pdf_format hook (skipped when user is picking columns).
+		const can_use_hook =
+			!print_settings.columns?.length &&
+			typeof this.report_settings.get_pdf_format === "function";
+		const template = can_use_hook
+			? await this.report_settings.get_pdf_format(this, bundled_template)
+			: bundled_template;
+		return { template, print_format_type: "JS", print_format: null };
 	}
 
 	async get_report_print_format(report_name) {
@@ -1722,7 +1712,39 @@ frappe.views.QueryReport = class QueryReport extends frappe.views.BaseList {
 		}
 	}
 
-	async print_report_jinja(print_settings, print_format) {
+	async print_report_via_jinja(print_settings, print_format) {
+		const content = await this.render_report_jinja(print_settings, print_format);
+		if (content === null) return;
+
+		frappe.render_grid({
+			title: __(this.report_name),
+			content: content,
+			print_settings: print_settings,
+			landscape: print_settings.orientation == "Landscape",
+			columns: [],
+		});
+	}
+
+	async print_report_via_js(print_settings, custom_format) {
+		await this.render_report_letterhead(print_settings);
+
+		frappe.render_grid({
+			template: this.get_print_template(print_settings, custom_format),
+			title: __(this.report_name),
+			subtitle: print_settings?.include_filters ? this.get_filters_html_for_print() : null,
+			print_settings: print_settings,
+			landscape: print_settings.orientation == "Landscape",
+			filters: this.get_filter_values(),
+			data: this.get_data_for_print(),
+			columns: this.get_columns_for_print(print_settings, custom_format),
+			original_data: this.data,
+			report: this,
+			can_use_smaller_font:
+				this.report_doc.is_standard === "Yes" && custom_format?.template ? 0 : 1,
+		});
+	}
+
+	async render_report_jinja(print_settings, print_format) {
 		const with_letter_head = print_settings.with_letter_head ? 1 : 0;
 		const r = await frappe.call({
 			method: "frappe.utils.print_format.render_report_jinja",
@@ -1736,26 +1758,22 @@ frappe.views.QueryReport = class QueryReport extends frappe.views.BaseList {
 		});
 		if (!r.message) {
 			frappe.msgprint(__("Failed to render report"));
-			return;
+			return null;
 		}
+		const rendered = r.message;
+		print_settings.letter_head = rendered.letter_head || null;
+		return `<style>${rendered.style || ""}</style>${rendered.html}`;
+	}
 
-		const { html, style, letter_head } = r.message;
-		print_settings.letter_head = letter_head || null;
-
-		frappe.render_grid({
-			title: __(this.report_name),
-			content: `<style>${style || ""}</style>${html}`,
-			print_settings: print_settings,
-			landscape: print_settings.orientation == "Landscape",
-			columns: [],
-		});
+	get_print_template(print_settings, custom_format) {
+		const template = custom_format?.template;
+		return print_settings.columns?.length || !template ? "print_grid" : template;
 	}
 
 	async render_report_letterhead(print_settings) {
 		if (!print_settings.with_letter_head || !print_settings.letter_head_name) return;
 
-		const filters = this.get_filter_values ? this.get_filter_values() : {};
-		const doc_context = Object.assign({}, filters);
+		const doc_context = Object.assign({}, this.get_filter_values());
 
 		if (!doc_context.company) {
 			doc_context.company = frappe.defaults.get_default("company");
