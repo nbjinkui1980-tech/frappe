@@ -327,14 +327,14 @@ def render_letterhead_for_print(letterhead: str | None = None, doc: dict | str |
 @frappe.read_only()
 def render_report_jinja(
 	report_name: str,
+	data: str | list | None = None,
+	columns: str | list | None = None,
 	filters: str | dict | None = None,
 	print_format: str | None = None,
 	letterhead: str | None = None,
 	no_letterhead: bool | int = 0,
 ) -> dict:
-	"""Render a Report print format authored in Jinja, server-side."""
-	from frappe.desk.query_report import run
-
+	"""Render a Report print format authored in Jinja, using client-supplied data."""
 	if not print_format:
 		frappe.throw(_("Print Format is required"))
 
@@ -354,25 +354,24 @@ def render_report_jinja(
 		frappe.throw(_("Print Format {0} has no HTML body").format(print_format))
 
 	filters = frappe.parse_json(filters) if isinstance(filters, str) else (filters or {})
-
-	# run() enforces report + filter permissions and is prepared-report aware
-	result = run(report_name, filters)
+	rows = frappe.parse_json(data) if isinstance(data, str) else (data or [])
+	cols = frappe.parse_json(columns) if isinstance(columns, str) else (columns or [])
 
 	# Wrap rows as _dict so templates can pass `row` to frappe.format_value safely.
-	data = [frappe._dict(row) if isinstance(row, dict) else row for row in (result.get("result") or [])]
+	rows = [frappe._dict(row) if isinstance(row, dict) else row for row in rows]
 
 	context = {
 		"report": frappe._dict(name=report_name, report_name=report_name),
 		"filters": frappe._dict(filters),
-		"columns": result.get("columns") or [],
-		"data": data,
+		"columns": cols,
+		"data": rows,
 		"no_letterhead": cint(no_letterhead),
 		"print_settings": frappe.get_single("Print Settings").as_dict(),
 	}
 
 	# CSS comes only from the format; print window provides boot.print_css baseline.
 	html = render_template(pf.html, context, safe_render=True)
-	style = pf.css or ""
+	body = f"<style>{pf.css or ''}</style>{html}"
 
 	letter_head = (
 		None
@@ -380,7 +379,7 @@ def render_report_jinja(
 		else (render_letterhead_for_print(letterhead=letterhead, doc=filters) or None)
 	)
 
-	return {"html": html, "style": style, "letter_head": letter_head}
+	return {"body": body, "letter_head": letter_head}
 
 
 @frappe.whitelist()

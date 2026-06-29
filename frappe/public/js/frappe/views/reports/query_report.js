@@ -1583,27 +1583,26 @@ frappe.views.QueryReport = class QueryReport extends frappe.views.BaseList {
 	}
 
 	async print_report(print_settings) {
-		const custom_format = await this.get_custom_format(print_settings);
+		const format = await this.resolve_print_format(print_settings);
 
 		this.make_access_log("Print", "PDF");
 
-		if (custom_format?.print_format_type === "Jinja" && custom_format.print_format) {
-			return this.print_report_via_jinja(print_settings, custom_format.print_format);
+		if (format.type === "jinja") {
+			return this.print_report_via_jinja(print_settings, format);
 		}
-
-		return this.print_report_via_js(print_settings, custom_format);
+		return this.print_report_via_js(print_settings, format);
 	}
 
 	async pdf_report(print_settings) {
-		const custom_format = await this.get_custom_format(print_settings);
-		const is_jinja =
-			custom_format?.print_format_type === "Jinja" && custom_format.print_format;
+		const format = await this.resolve_print_format(print_settings);
 
 		this.make_access_log("Print", "PDF");
+		frappe.show_alert({ message: __("Generating PDF..."), indicator: "blue" }, 5);
 
-		const body = is_jinja
-			? await this.render_pdf_body_jinja(print_settings, custom_format.print_format)
-			: await this.render_pdf_body_js(print_settings, custom_format);
+		const body =
+			format.type === "jinja"
+				? await this.render_pdf_body_jinja(print_settings, format)
+				: await this.render_pdf_body_js(print_settings, format);
 		if (!body) return;
 
 		const html = frappe.render_template("print_template", {
@@ -1622,17 +1621,17 @@ frappe.views.QueryReport = class QueryReport extends frappe.views.BaseList {
 		frappe.render_pdf(html, print_settings);
 	}
 
-	async render_pdf_body_jinja(print_settings, print_format) {
-		const content = await this.render_report_jinja(print_settings, print_format);
+	async render_pdf_body_jinja(print_settings, format) {
+		const content = await this.render_report_jinja(print_settings, format.print_format);
 		if (content === null) return null;
 		return { content, can_use_smaller_font: 0 };
 	}
 
-	async render_pdf_body_js(print_settings, custom_format) {
+	async render_pdf_body_js(print_settings, format) {
 		await this.render_report_letterhead(print_settings);
 
-		const columns = this.get_columns_for_print(print_settings, custom_format);
-		const template = this.get_print_template(print_settings, custom_format);
+		const columns = this.get_columns_for_print(print_settings, format);
+		const template = format.type === "grid" ? "print_grid" : format.body;
 		const content = frappe.render_template(template, {
 			title: __(this.report_name),
 			subtitle: print_settings?.include_filters ? this.get_filters_html_for_print() : null,
@@ -1645,12 +1644,12 @@ frappe.views.QueryReport = class QueryReport extends frappe.views.BaseList {
 		});
 		return {
 			content,
-			can_use_smaller_font: this.compute_smaller_font(custom_format, columns),
+			can_use_smaller_font: this.compute_smaller_font(format, columns),
 		};
 	}
 
-	compute_smaller_font(custom_format, columns) {
-		const allow_shrink = !(this.report_doc.is_standard === "Yes" && custom_format?.template);
+	compute_smaller_font(format, columns) {
+		const allow_shrink = !(this.report_doc.is_standard === "Yes" && format.type !== "grid");
 		return allow_shrink && columns.length > 20 ? 1 : 0;
 	}
 
@@ -1668,58 +1667,55 @@ frappe.views.QueryReport = class QueryReport extends frappe.views.BaseList {
 			: `${__(this.report_name)}.pdf`;
 	}
 
-	async get_custom_format(print_settings) {
-		const requested_format = print_settings.print_format || print_settings.report;
-		const bundled_template = this.report_settings.html_format || null;
+	async resolve_print_format(print_settings) {
+		// User picking columns is mutually exclusive with custom templates.
+		if (print_settings.columns?.length) return { type: "grid" };
 
-		if (requested_format) {
-			const fetched = await this.get_report_print_format(requested_format);
+		const requested = print_settings.print_format || print_settings.report;
+		if (requested) {
+			const fetched = await this.get_report_print_format(requested);
 			if (fetched) {
-				return {
-					template: fetched.template,
-					print_format_type: fetched.print_format_type || "JS",
-					print_format: requested_format,
-				};
+				return fetched.print_format_type === "Jinja"
+					? { type: "jinja", print_format: requested }
+					: { type: "js", body: fetched.template };
 			}
-			return { template: bundled_template, print_format_type: "JS", print_format: null };
+			frappe.show_alert(
+				{
+					message: __("Print Format {0} not available; using default", [requested]),
+					indicator: "orange",
+				},
+				5
+			);
 		}
 
-		// No print format picked — use the bundled JS template, optionally overridden by
-		// the report module's get_pdf_format hook (skipped when user is picking columns).
-		const can_use_hook =
-			!print_settings.columns?.length &&
-			typeof this.report_settings.get_pdf_format === "function";
-		const template = can_use_hook
-			? await this.report_settings.get_pdf_format(this, bundled_template)
-			: bundled_template;
-		return { template, print_format_type: "JS", print_format: null };
+		// No (usable) request — bundled JS template, with optional module-hook override.
+		// The hook's return value is authoritative: null means "no template, use grid".
+		const bundled = this.report_settings.html_format || null;
+		const resolved =
+			typeof this.report_settings.get_pdf_format === "function"
+				? await this.report_settings.get_pdf_format(this, bundled)
+				: bundled;
+		return resolved ? { type: "js", body: resolved } : { type: "grid" };
 	}
 
 	async get_report_print_format(report_name) {
-		const filters = {
-			name: report_name,
-			disabled: 0,
-		};
+		const filters = { name: report_name, disabled: 0 };
 		const r = await frappe.db.get_value("Print Format", filters, [
 			"html",
 			"css",
 			"print_format_type",
 		]);
-		if (r && r.message && r.message.html) {
-			const css = r.message.css || "";
-			const html = r.message.html || "";
-			return {
-				template: `<style>${css}</style>${html}`,
-				print_format_type: r.message.print_format_type || "JS",
-			};
-		} else {
-			frappe.msgprint(__("Print Format not found"));
-			return null;
-		}
+		if (!r?.message?.html) return null;
+		const css = r.message.css || "";
+		const html = r.message.html;
+		return {
+			template: `<style>${css}</style>${html}`,
+			print_format_type: r.message.print_format_type || "JS",
+		};
 	}
 
-	async print_report_via_jinja(print_settings, print_format) {
-		const content = await this.render_report_jinja(print_settings, print_format);
+	async print_report_via_jinja(print_settings, format) {
+		const content = await this.render_report_jinja(print_settings, format.print_format);
 		if (content === null) return;
 
 		frappe.render_grid({
@@ -1730,13 +1726,13 @@ frappe.views.QueryReport = class QueryReport extends frappe.views.BaseList {
 		});
 	}
 
-	async print_report_via_js(print_settings, custom_format) {
+	async print_report_via_js(print_settings, format) {
 		await this.render_report_letterhead(print_settings);
 
-		const columns = this.get_columns_for_print(print_settings, custom_format);
+		const columns = this.get_columns_for_print(print_settings, format);
 
 		frappe.render_grid({
-			template: this.get_print_template(print_settings, custom_format),
+			template: format.type === "grid" ? "print_grid" : format.body,
 			title: __(this.report_name),
 			subtitle: print_settings?.include_filters ? this.get_filters_html_for_print() : null,
 			print_settings: print_settings,
@@ -1746,7 +1742,7 @@ frappe.views.QueryReport = class QueryReport extends frappe.views.BaseList {
 			columns: columns,
 			original_data: this.data,
 			report: this,
-			can_use_smaller_font: this.compute_smaller_font(custom_format, columns),
+			can_use_smaller_font: this.compute_smaller_font(format, columns),
 		});
 	}
 
@@ -1756,6 +1752,8 @@ frappe.views.QueryReport = class QueryReport extends frappe.views.BaseList {
 			method: "frappe.utils.print_format.render_report_jinja",
 			args: {
 				report_name: this.report_name,
+				data: this.get_data_for_print(),
+				columns: this.columns,
 				filters: this.get_filter_values(),
 				print_format: print_format,
 				letterhead: with_letter_head ? print_settings.letter_head_name || null : null,
@@ -1768,12 +1766,7 @@ frappe.views.QueryReport = class QueryReport extends frappe.views.BaseList {
 		}
 		const rendered = r.message;
 		print_settings.letter_head = rendered.letter_head || null;
-		return `<style>${rendered.style || ""}</style>${rendered.html}`;
-	}
-
-	get_print_template(print_settings, custom_format) {
-		const template = custom_format?.template;
-		return print_settings.columns?.length || !template ? "print_grid" : template;
+		return rendered.body;
 	}
 
 	async render_report_letterhead(print_settings) {
@@ -1996,18 +1989,14 @@ frappe.views.QueryReport = class QueryReport extends frappe.views.BaseList {
 		return rows;
 	}
 
-	get_columns_for_print(print_settings, custom_format) {
-		let columns = [];
-
-		if (print_settings && print_settings.columns?.length) {
-			columns = this.get_visible_columns().filter((column) =>
+	get_columns_for_print(print_settings, format) {
+		if (print_settings?.columns?.length) {
+			return this.get_visible_columns().filter((column) =>
 				print_settings.columns.includes(column.fieldname)
 			);
-		} else {
-			columns = custom_format?.template ? this.columns : this.get_visible_columns();
 		}
-
-		return columns;
+		// Custom templates get the canonical column set; the grid uses what's visible.
+		return format?.type === "grid" ? this.get_visible_columns() : this.columns;
 	}
 
 	get_menu_items() {
