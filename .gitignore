@@ -200,3 +200,7 @@ cypress/videos
 .aider*
 # Playwright AI
 .playwright-mcp
+
+# SQLite sidecar files
+*.db-wal
+*.db-shm

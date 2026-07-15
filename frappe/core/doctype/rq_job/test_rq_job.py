@@ -3,6 +3,7 @@
 # See license.txt
 
 import time
+from unittest import skipIf
 
 from rq import exceptions as rq_exc
 from rq.job import Job
@@ -173,6 +174,7 @@ class TestRQJob(IntegrationTestCase):
 		self.check_status(job, "finished")
 		self.assertFalse(is_job_enqueued(job_id))
 
+	@skipIf(frappe.conf.db_type == "sqlite", "worker can't commit while the test holds the write lock")
 	def test_auto_job_dedup(self):
 		job_id = "test_dedup"
 		job1 = frappe.enqueue(self.BG_JOB, sleep=2, job_id=job_id, deduplicate=True)
@@ -229,8 +231,13 @@ class TestRQJob(IntegrationTestCase):
 		# TODO: Observed higher usage on 2026-05-26. Temporarily raising the limit
 		LAST_MEASURED_USAGE += 1
 
+		# TODO: Observed higher usage on 2026-07-15 (Python 3.14). Temporarily raising the limit
+		# Result of adding sqlglot
+		LAST_MEASURED_USAGE += 1
+
 		self.assertLessEqual(rss, LAST_MEASURED_USAGE * 1.05, msg)
 
+	@skipIf(frappe.conf.db_type == "sqlite", "worker can't commit while the test holds the write lock")
 	def test_clear_failed_jobs(self):
 		limit = 10
 		update_site_config("rq_failed_jobs_limit", limit)

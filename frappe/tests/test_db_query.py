@@ -218,7 +218,7 @@ class TestDBQuery(IntegrationTestCase):
 			filters=[["Note Seen By", "user", "=", "Administrator"]], fields=["name", "title"], run=0
 		)
 		self.assertEqual(query.tables, ["`tabNote`"])
-		self.assertIn("exists (", sql)
+		self.assertIn("exists", sql.lower())
 
 		# the dedup group by sent by list views is dropped once nothing multiplies rows
 		sql = DatabaseQuery("Note").execute(
@@ -227,7 +227,7 @@ class TestDBQuery(IntegrationTestCase):
 			group_by="`tabNote`.`name`",
 			run=0,
 		)
-		self.assertNotIn("group by", sql)
+		self.assertNotIn("group by", sql.lower())
 
 	def test_child_table_filter_with_link_field_fetch(self):
 		"""Full list view repro of GH-39851: child-table filter + link table column in
@@ -348,7 +348,7 @@ class TestDBQuery(IntegrationTestCase):
 			run=0,
 		)
 		self.assertIn("`tabNote Seen By`", query.tables)
-		self.assertNotIn("exists (", sql)
+		self.assertNotIn("exists", sql.lower())
 
 		# the surviving dedup group by must not break when link table columns are
 		# selected (GH-39851 with the join fallback)
@@ -454,7 +454,7 @@ class TestDBQuery(IntegrationTestCase):
 			)
 
 		self.assertIn("`tabNote Seen By`", query.tables)
-		self.assertNotIn("exists (", sql)
+		self.assertNotIn("exists", sql.lower())
 
 	def test_link_field_syntax(self):
 		todo = frappe.get_doc(doctype="ToDo", description="Test ToDo", allocated_to="Administrator").insert()
@@ -493,7 +493,7 @@ class TestDBQuery(IntegrationTestCase):
 			in build_match_conditions(as_condition=False)
 		)
 		# get as conditions
-		if frappe.db.db_type == "mariadb":
+		if frappe.db.db_type in ("mariadb", "sqlite"):
 			assertion_string = """(((ifnull(`tabTest Blog Post`.`name`, '')='' or `tabTest Blog Post`.`name` in ('_Test Blog Post 1', '_Test Blog Post'))))"""
 		elif frappe.db.db_type == "postgres":
 			assertion_string = """(((ifnull(cast(`tabTest Blog Post`.`name` as varchar), '')='' or cast(`tabTest Blog Post`.`name` as varchar) in ('_Test Blog Post 1', '_Test Blog Post'))))"""
@@ -658,16 +658,20 @@ class TestDBQuery(IntegrationTestCase):
 		cond = get_between_date_filter([start, end], date_df)
 		self.assertQueryEqual(cond, f"'{start}' AND '{end}'")
 
+		# SQLite stores datetimes via isoformat, which omits the microsecond part when it is
+		# zero; MariaDB/Postgres always render it as .000000.
+		zero_us = "" if frappe.db.db_type == "sqlite" else ".000000"
+
 		# single date should include entire day
 		start = "2021-01-01"
 		cond = get_between_date_filter([start, start], datetime_df)
-		self.assertQueryEqual(cond, f"'{start} 00:00:00.000000' AND '{start} 23:59:59.999999'")
+		self.assertQueryEqual(cond, f"'{start} 00:00:00{zero_us}' AND '{start} 23:59:59.999999'")
 
 		# datetime field on datetime type should remain same
 		start = "2021-01-01 01:01:00"
 		end = "2022-01-02 12:23:43"
 		cond = get_between_date_filter([start, end], datetime_df)
-		self.assertQueryEqual(cond, f"'{start}.000000' AND '{end}.000000'")
+		self.assertQueryEqual(cond, f"'{start}{zero_us}' AND '{end}{zero_us}'")
 
 	def test_ignore_permissions_for_get_filters_cond(self):
 		frappe.set_user("test2@example.com")
@@ -1353,6 +1357,13 @@ class TestDBQuery(IntegrationTestCase):
 			self.assertTrue('strpos( cast("tabautoinc_dt_test"."name" as varchar), \'1\')' in query)
 			self.assertTrue("strpos( cast(name as varchar), '1')" in query)
 			self.assertTrue('where cast("tabautoinc_dt_test"."name" as varchar) = \'1\'' in query)
+		elif frappe.db.db_type == "sqlite":
+			# This is raw SQL (locate() written as a literal field expression), so it goes through
+			# modify_query (sqlglot mysql->sqlite): backticks become double-quotes and MariaDB
+			# LOCATE(sub, str) becomes SQLite INSTR(str, sub) (arguments swapped).
+			self.assertTrue('INSTR("tabautoinc_dt_test"."name", \'1\')' in query)
+			self.assertTrue("INSTR(name, '1')" in query)
+			self.assertTrue('WHERE "tabautoinc_dt_test"."name" = 1' in query)
 		else:
 			self.assertTrue("locate('1', `tabautoinc_dt_test`.`name`)" in query)
 			self.assertTrue("locate('1', name)" in query)

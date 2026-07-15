@@ -1,8 +1,17 @@
+import logging
 import re
 import sqlite3
+import typing
 import warnings
-from datetime import date, datetime, time
+from contextlib import contextmanager
+from datetime import date, datetime, time, timedelta
+from decimal import Decimal
 from pathlib import Path
+
+import sqlglot
+from sqlglot import exp
+from sqlglot.dialects.mysql import MySQL as _MySQLDialect
+from sqlglot.dialects.sqlite import SQLite as _SQLiteDialect
 
 import frappe
 from frappe.database.database import (
@@ -10,20 +19,52 @@ from frappe.database.database import (
 	Database,
 	ImplicitCommitError,
 )
+from frappe.database.sqlite import functions
 from frappe.database.sqlite.schema import SQLiteTable
 from frappe.utils import get_table_name
 
-_PARAM_COMP = re.compile(r"%\([\w]*\)s")
+# Global converters/adapters, registered once at import. No REAL converter: floats are rounded to 9dp.
+sqlite3.register_converter("datetime", functions.converter_datetime)
+sqlite3.register_converter("timestamp", functions.converter_datetime)
+sqlite3.register_converter("date", functions.converter_date)
+sqlite3.register_converter("time", functions.converter_time)
+sqlite3.register_adapter(datetime, functions.adapter_datetime)
+sqlite3.register_adapter(date, functions.adapter_date)
+sqlite3.register_adapter(time, functions.adapter_time)
+sqlite3.register_adapter(Decimal, functions.adapter_decimal)
+sqlite3.register_adapter(timedelta, functions.adapter_timedelta)
+
+# Mute sqlglot's "unsupported construct" warnings (e.g. FOR UPDATE, which we drop on purpose).
+_sqlglot_logger = logging.getLogger("sqlglot")
+_sqlglot_logger.addHandler(logging.NullHandler())
+_sqlglot_logger.propagate = False
+
+_PARAM_COMP = re.compile(r"%\((\w+)\)s")
+# Opaque spans to skip when rewriting placeholders: single-quoted string literals (with ''
+# escapes) and SQL comments. Apostrophes inside a comment must not open a string literal.
+_LITERAL_OR_COMMENT = re.compile(
+	r"'(?:[^']|'')*'"  # single-quoted string literal
+	r"|--[^\n]*"  # -- line comment
+	r"|/\*.*?\*/",  # /* block comment */
+	re.DOTALL,
+)
 IMPLICIT_COMMIT_QUERY_TYPES = frozenset(("start", "alter", "drop", "create", "truncate"))
 
 
 class SequenceGeneratorLimitExceeded(sqlite3.Error):
-	"""Raised when an emulated sequence with a max_value (and no cycle) is exhausted.
+	"""Raised when an emulated sequence with a max_value (and no cycle) is exhausted."""
 
-	SQLite has no native sequences (frappe emulates them, see
-	``frappe.database.sequence``), so unlike MariaDB/Postgres there is no driver
-	exception to reuse for this case.
-	"""
+
+def _split_sql_literals(query: str):
+	"""Yield (is_opaque, chunk) over query; opaque chunks are string literals or comments, left as-is."""
+	pos = 0
+	for m in _LITERAL_OR_COMMENT.finditer(query):
+		if m.start() > pos:
+			yield False, query[pos : m.start()]
+		yield True, m.group(0)
+		pos = m.end()
+	if pos < len(query):
+		yield False, query[pos:]
 
 
 class SQLiteExceptionUtil:
@@ -40,7 +81,7 @@ class SQLiteExceptionUtil:
 
 	@staticmethod
 	def is_timedout(e: sqlite3.Error) -> bool:
-		return "database is locked" in str(e)
+		return SQLiteExceptionUtil.is_deadlocked(e)
 
 	@staticmethod
 	def is_read_only_mode_error(e: sqlite3.Error) -> bool:
@@ -87,24 +128,17 @@ class SQLiteExceptionUtil:
 		return "too many columns" in str(e)
 
 	@staticmethod
-	def is_primary_key_violation(e: sqlite3.IntegrityError) -> bool:
-		if hasattr(e, "sqlite_errorcode"):
-			return e.sqlite_errorcode == 1555
-		return "UNIQUE constraint failed" in str(e)
+	def is_primary_key_violation(e: sqlite3.Error) -> bool:
+		# Callers pass arbitrary exceptions here, so guard the sqlite3-only attribute.
+		return getattr(e, "sqlite_errorcode", None) == sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY
 
 	@staticmethod
-	def is_unique_key_violation(e: sqlite3.IntegrityError) -> bool:
-		if hasattr(e, "sqlite_errorcode"):
-			return e.sqlite_errorcode == 2067
-		return "UNIQUE constraint failed" in str(e)
+	def is_unique_key_violation(e: sqlite3.Error) -> bool:
+		return getattr(e, "sqlite_errorcode", None) == sqlite3.SQLITE_CONSTRAINT_UNIQUE
 
 	@staticmethod
 	def is_interface_error(e: sqlite3.Error):
 		return isinstance(e, sqlite3.InterfaceError)
-
-	@staticmethod
-	def is_nested_transaction_error(e: sqlite3.Error):
-		return "cannot start a transaction within a transaction" in str(e)
 
 
 class SQLiteDatabase(SQLiteExceptionUtil, Database):
@@ -113,14 +147,57 @@ class SQLiteDatabase(SQLiteExceptionUtil, Database):
 	MAX_ROW_SIZE_LIMIT = None
 	SequenceGeneratorLimitExceeded = SequenceGeneratorLimitExceeded
 
+	# Milliseconds to wait for a write lock before "database is locked". Override with `sqlite_busy_timeout`.
+	DEFAULT_BUSY_TIMEOUT = 30_000
+
+	# Retry `BEGIN IMMEDIATE` a few times on write-lock contention.
+	WRITE_LOCK_RETRIES = 5
+
+	# True when the current connection is the mode=ro one. Class default so it reads before connect().
+	read_only = False
+
+	@property
+	def busy_timeout(self) -> int:
+		from frappe.utils.data import cint
+
+		return cint(frappe.conf.get("sqlite_busy_timeout")) or self.DEFAULT_BUSY_TIMEOUT
+
 	def get_connection(self, read_only: bool = False):
+		from frappe.utils import now, nowdate, nowtime
+
 		conn = self.create_connection(read_only)
-		conn.create_function("regexp", 2, regexp)
-		conn.create_function("regexp_replace", 3, regexp_replace)
+		# Treat unknown double-quoted names as an error ("no such column"), not a string literal.
+		conn.setconfig(sqlite3.SQLITE_DBCONFIG_DQS_DDL, False)
+		conn.setconfig(sqlite3.SQLITE_DBCONFIG_DQS_DML, False)
+		# MariaDB SQL functions frappe's queries call: (name, arg count, impl).
+		scalar_functions = (
+			("now", 0, now),
+			("curdate", 0, nowdate),
+			("curtime", 0, nowtime),
+			("regexp", 2, functions.regexp),
+			("regexp_replace", 3, functions.regexp_replace),
+			("utc_timestamp", 0, functions.utc_timestamp),
+			("unix_timestamp", -1, functions.unix_timestamp),
+			("timestamp", -1, functions.timestamp),
+			("to_seconds", 1, functions.to_seconds),
+			("timediff", 2, functions.timediff),
+			("hour", 1, functions.hour),
+			("datediff", 2, functions.datediff),
+			("date_format", 2, functions.date_format),
+			("monthname", 1, functions.monthname),
+			("quarter", 1, functions.quarter),
+			("substring_index", 3, functions.substring_index),
+			("month", 1, functions.date_part("month")),
+			("year", 1, functions.date_part("year")),
+			("day", 1, functions.date_part("day")),
+			("dayofmonth", 1, functions.date_part("day")),
+		)
+		for name, argc, fn in scalar_functions:
+			conn.create_function(name, argc, fn)
 		pragmas = {
 			"journal_mode": "WAL",
 			"synchronous": "NORMAL",
-			"busy_timeout": 5000,  # in milliseconds
+			"busy_timeout": self.busy_timeout,
 		}
 		cursor = conn.cursor()
 		for pragma, value in pragmas.items():
@@ -130,23 +207,25 @@ class SQLiteDatabase(SQLiteExceptionUtil, Database):
 
 	def create_connection(self, read_only: bool = False):
 		db_path = self.get_db_path()
-		sqlite3.register_converter("timestamp", lambda x: datetime.fromisoformat(x.decode()))
-		sqlite3.register_converter("date", lambda x: date.fromisoformat(x.decode()))
-		sqlite3.register_converter("time", lambda x: time.fromisoformat(x.decode()))
-		if read_only:
-			return sqlite3.connect(
-				f"file:{db_path}?mode=ro",
-				uri=True,
-				detect_types=sqlite3.PARSE_DECLTYPES,
-				timeout=15,
-			)
-		return sqlite3.connect(db_path, detect_types=sqlite3.PARSE_DECLTYPES, timeout=15)
+		# mode=ro needs a file: URI; a writable connection takes the plain path.
+		dsn = f"file:{db_path}?mode=ro" if read_only else db_path
+		return sqlite3.connect(
+			dsn,
+			uri=read_only,
+			detect_types=sqlite3.PARSE_DECLTYPES,
+			timeout=self.busy_timeout / 1000,
+			isolation_level=None,
+		)
 
 	def get_db_path(self):
 		return Path(frappe.get_site_path()) / "db" / f"{self.cur_db_name}.db"
 
 	def set_execution_timeout(self, seconds: int):
-		self.sql(f"PRAGMA busy_timeout = {int(seconds) * 1000}")
+		# SQLite has no statement-execution timeout, so map to busy_timeout (the lock wait), the
+		# closest analogue. Honour the requested value rather than max()-ing with the default, which
+		# would silently ignore a shorter timeout; 0 means "no limit" and restores the default wait.
+		timeout = int(seconds) * 1000 if seconds else self.busy_timeout
+		self._cursor.execute(f"PRAGMA busy_timeout = {timeout}")
 
 	def setup_type_map(self):
 		self.db_type = "sqlite"
@@ -196,9 +275,31 @@ class SQLiteDatabase(SQLiteExceptionUtil, Database):
 	def _clean_up(self):
 		pass
 
+	def _transform_result(self, result):
+		"""Convert list of rows to tuple-of-tuples (PyMySQL compat) and round floats to 9dp."""
+		return tuple(tuple(round(v, 9) if type(v) is float else v for v in row) for row in result)
+
+	def fetch_as_dict(self, result):
+		"""Build _dict rows, unquote column names, and round floats to 9dp."""
+		if not result:
+			return []
+		keys = []
+		for col in self._cursor.description:
+			name = col[0]
+			if name.startswith('"') and name.endswith('"') and len(name) > 2:
+				name = name[1:-1]
+			keys.append(name)
+		return [
+			frappe._dict(
+				{k: (round(v, 9) if type(v) is float else v) for k, v in zip(keys, row, strict=False)}
+			)
+			for row in result
+		]
+
 	@staticmethod
 	def escape(s, percent=True):
 		"""Escape quotes and percent in given string."""
+		s = frappe.as_unicode(s)
 		s = s.replace("'", "''")
 		if percent:
 			s = s.replace("%", "%%")
@@ -226,78 +327,105 @@ class SQLiteDatabase(SQLiteExceptionUtil, Database):
 	) -> list | tuple:
 		"""Change column type by recreating the table"""
 		table_name = get_table_name(doctype)
-		temp_table = f"{table_name}_new"
-
-		# Get current table column definitions
-		columns = []
-		column_exists = False
-		for col in self.sql(f"PRAGMA table_info(`{table_name}`)", as_dict=1):
-			if col["name"] == column:
-				column_exists = True
-				null_str = "" if nullable else " NOT NULL"
-				columns.append(f"`{col['name']}` {type}{null_str}")
-			else:
-				null_str = "" if col["notnull"] == 0 else " NOT NULL"
-				columns.append(f"`{col['name']}` {col['type']}{null_str}")
-
-		# Check that the column exists
-		if not column_exists:
+		cols = self.sql(f"PRAGMA table_info(`{table_name}`)", as_dict=1)
+		if not any(col["name"] == column for col in cols):
 			raise frappe.InvalidColumnName(f"Column {column} does not exist in table {table_name}")
 
-		# Create new table
-		create_table = f"CREATE TABLE `{temp_table}` (\n{','.join(columns)}\n)"
-		self.sql_ddl(create_table)
+		column_defs = []
+		pk_columns = []
+		for col in cols:
+			if col["name"] == column:
+				null_str = "" if nullable else " NOT NULL"
+				column_defs.append(f"`{col['name']}` {type}{null_str}")
+			else:
+				null_str = "" if col["notnull"] == 0 else " NOT NULL"
+				column_defs.append(f"`{col['name']}` {col['type']}{null_str}")
+			# PRAGMA table_info omits the PRIMARY KEY clause, so re-emit it or the rebuild drops it.
+			if col["pk"]:
+				pk_columns.append((col["pk"], col["name"]))
 
-		# Copy data
-		column_names = [
-			f"`{col['name']}`" for col in self.sql(f"PRAGMA table_info(`{table_name}`)", as_dict=1)
-		]
-		column_list = ", ".join(column_names)
-		self.sql_ddl(f"INSERT INTO `{temp_table}` SELECT {column_list} FROM `{table_name}`")
+		if pk_columns:
+			pk = ", ".join(f"`{name}`" for _, name in sorted(pk_columns))
+			column_defs.append(f"PRIMARY KEY ({pk})")
 
-		# Drop old table and rename new table
-		self.sql_ddl(f"DROP TABLE `{table_name}`")
-		self.sql_ddl(f"ALTER TABLE `{temp_table}` RENAME TO `{table_name}`")
+		select_columns = [f"`{col['name']}`" for col in cols]
+		self._rebuild_table(table_name, column_defs, select_columns)
 
 	def rename_column(self, doctype: str, old_column_name: str, new_column_name: str):
 		"""Rename column by recreating the table"""
 		table_name = get_table_name(doctype)
-		temp_table = f"{table_name}_new"
-
-		# Get current table column definitions
-		columns = []
-		column_exists = False
-		for col in self.sql(f"PRAGMA table_info(`{table_name}`)", as_dict=1):
-			if col["name"] == old_column_name:
-				column_exists = True
-				null_str = "" if col["notnull"] == 0 else " NOT NULL"
-				columns.append(f"`{new_column_name}` {col['type']}{null_str}")
-			else:
-				null_str = "" if col["notnull"] == 0 else " NOT NULL"
-				columns.append(f"`{col['name']}` {col['type']}{null_str}")
-
-		if not column_exists:
+		cols = self.sql(f"PRAGMA table_info(`{table_name}`)", as_dict=1)
+		if not any(col["name"] == old_column_name for col in cols):
 			raise frappe.InvalidColumnName(f"Column {old_column_name} does not exist in table {table_name}")
 
-		# Create new table
-		create_table = f"CREATE TABLE `{temp_table}` (\n{','.join(columns)}\n)"
-		self.sql_ddl(create_table)
-
-		# Get list of columns for SELECT, replacing old name with new
-		column_names = []
-		for col in self.sql(f"PRAGMA table_info(`{table_name}`)", as_dict=1):
+		column_defs = []
+		select_columns = []
+		pk_columns = []
+		for col in cols:
+			null_str = "" if col["notnull"] == 0 else " NOT NULL"
 			if col["name"] == old_column_name:
-				column_names.append(f"`{old_column_name}` as `{new_column_name}`")
+				pk_name = new_column_name
+				column_defs.append(f"`{new_column_name}` {col['type']}{null_str}")
+				select_columns.append(f"`{old_column_name}` as `{new_column_name}`")
 			else:
-				column_names.append(f"`{col['name']}`")
+				pk_name = col["name"]
+				column_defs.append(f"`{col['name']}` {col['type']}{null_str}")
+				select_columns.append(f"`{col['name']}`")
+			# PRAGMA table_info omits the PRIMARY KEY clause, so re-emit it (with the renamed
+			# column) or the rebuild drops it.
+			if col["pk"]:
+				pk_columns.append((col["pk"], pk_name))
 
-		# Copy data
-		column_list = ", ".join(column_names)
-		self.sql_ddl(f"INSERT INTO `{temp_table}` SELECT {column_list} FROM `{table_name}`")
+		if pk_columns:
+			pk = ", ".join(f"`{name}`" for _, name in sorted(pk_columns))
+			column_defs.append(f"PRIMARY KEY ({pk})")
 
-		# Drop old table and rename new table
-		self.sql_ddl(f"DROP TABLE `{table_name}`")
-		self.sql_ddl(f"ALTER TABLE `{temp_table}` RENAME TO `{table_name}`")
+		self._rebuild_table(table_name, column_defs, select_columns, {old_column_name: new_column_name})
+
+	def _rebuild_table(
+		self,
+		table_name: str,
+		column_defs: list[str],
+		select_columns: list[str],
+		renamed_columns: dict[str, str] | None = None,
+	) -> None:
+		"""Recreate `table_name` with `column_defs`, copying data via `select_columns`, then swap it in."""
+		# Dropping the table drops its user-defined indexes, so capture them for replay.
+		preserved_indexes = self._get_indexes_to_preserve(table_name, renamed_columns or {})
+
+		temp_table = f"{table_name}_new"
+		# Run the whole swap in one transaction (SQLite DDL is transactional) instead of per-statement
+		# sql_ddl commits, so a crash between DROP and RENAME can't leave the table missing.
+		self.commit()
+		try:
+			self.sql(f"CREATE TABLE `{temp_table}` (\n{','.join(column_defs)}\n)")
+			self.sql(f"INSERT INTO `{temp_table}` SELECT {', '.join(select_columns)} FROM `{table_name}`")
+			self.sql(f"DROP TABLE `{table_name}`")
+			self.sql(f"ALTER TABLE `{temp_table}` RENAME TO `{table_name}`")
+			for index_sql in preserved_indexes:
+				self.sql(index_sql)
+			self.commit()
+		except Exception:
+			self.rollback()
+			raise
+
+	def _get_indexes_to_preserve(self, table_name: str, renamed_columns: dict[str, str]) -> list[str]:
+		"""Return CREATE statements for user-defined indexes, remapping any renamed columns."""
+		statements = []
+		for index in self.sql(
+			"SELECT sql FROM sqlite_master WHERE type = 'index' AND tbl_name = %s AND sql IS NOT NULL",
+			(table_name,),
+			as_dict=True,
+		):
+			sql = index["sql"]
+			for old, new in renamed_columns.items():
+				# Match either quoting style: sqlglot stores CREATE INDEX with "col", but
+				# raw/backtick-quoted definitions can also appear. Only quoted forms are
+				# replaced so the column name isn't matched inside the index name.
+				for q in ("`", '"'):
+					sql = sql.replace(f"{q}{old}{q}", f"{q}{new}{q}")
+			statements.append(sql)
+		return statements
 
 	def create_auth_table(self):
 		self.sql_ddl(
@@ -335,13 +463,10 @@ class SQLiteDatabase(SQLiteExceptionUtil, Database):
 		)
 
 	def create_sequence_table(self):
-		# SQLite has no native sequences; this table emulates them for
-		# autoname:autoincrement doctypes. See frappe.database.sequence.
+		# SQLite has no native sequences; this table emulates them. See frappe.database.sequence.
 		from frappe.database.sequence import SQLITE_SEQUENCE_TABLE
 
-		# `declared` is 1 for sequences defined via create_sequence and 0 for rows
-		# auto-created by naming/set_next_val; it lets create_sequence adopt an
-		# implicit row without ever overwriting an explicit definition.
+		# `declared`=1 for explicit create_sequence rows, 0 for ones auto-created by naming.
 		self.sql_ddl(
 			f"""CREATE TABLE IF NOT EXISTS `{SQLITE_SEQUENCE_TABLE}` (
 			`name` TEXT PRIMARY KEY,
@@ -385,10 +510,8 @@ class SQLiteDatabase(SQLiteExceptionUtil, Database):
 	def add_index(
 		self, doctype: str, fields: list, index_name: str | None = None, using=None, where=None, include=None
 	):
-		"""Creates an index with given fields if not already created.
-		`using`/`where`/`include` are postgres-only (trigram/partial/covering); a `using` kind
-		has no SQLite equivalent so it is skipped, and a plain index covers all rows regardless of
-		`where`/`include`."""
+		"""Create an index on the given fields if absent. `using`/`where`/`include` are postgres-only
+		and ignored (a `using` kind has no SQLite equivalent)."""
 
 		from frappe.custom.doctype.property_setter.property_setter import (
 			make_property_setter,
@@ -404,17 +527,19 @@ class SQLiteDatabase(SQLiteExceptionUtil, Database):
 		self.commit()
 		self.sql(f"CREATE INDEX IF NOT EXISTS `{index_name}` ON `{table_name}` ({', '.join(fields)})")
 
-		# Ensure that DB migration doesn't clear this index, assuming this is manually added
-		# via code or console.
+		# Flag the field as search_index so migration keeps this manually-added index. Text-like
+		# fieldtypes can't carry the flag (doctype validation rejects it), but stay validly indexed.
 		if len(fields) == 1 and not (frappe.flags.in_install or frappe.flags.in_migrate):
-			make_property_setter(
-				doctype,
-				fields[0],
-				property="search_index",
-				value="1",
-				property_type="Check",
-				for_doctype=False,  # Applied on docfield
-			)
+			field = frappe.get_meta(doctype).get_field(fields[0])
+			if field and field.fieldtype not in ("Text", "Long Text", "Small Text", "Code", "Text Editor"):
+				make_property_setter(
+					doctype,
+					fields[0],
+					property="search_index",
+					value="1",
+					property_type="Check",
+					for_doctype=False,  # Applied on docfield
+				)
 
 	def add_unique(self, doctype, fields, constraint_name=None):
 		"""Creates unique constraint on fields."""
@@ -446,6 +571,16 @@ class SQLiteDatabase(SQLiteExceptionUtil, Database):
 	def get_database_list(self):
 		return [self.db_name]
 
+	@staticmethod
+	def format_datetime(value):
+		"""Match SQLite's stored format with isoformat(sep=" "); the base class over-appends microseconds."""
+		from frappe.database.utils import FallBackDateTimeStr
+		from frappe.utils import get_datetime
+
+		if not value:
+			return FallBackDateTimeStr
+		return get_datetime(value).isoformat(sep=" ")
+
 	def get_tables(self, cached=True):
 		"""Return list of tables."""
 		to_query = not cached
@@ -465,55 +600,98 @@ class SQLiteDatabase(SQLiteExceptionUtil, Database):
 		raise NotImplementedError("SQLite does not support getting row size directly.")
 
 	def execute_query(self, query, values=None):
-		query = query.replace("%s", "?")
-		try:
-			if isinstance(values, dict):
-				for k, v in values.items():
-					if isinstance(v, str) and "'" in v:
-						values[k] = self.escape(v)
-					else:
-						values[k] = f"'{v}'"
-				query = query % values
-		except TypeError:
-			pass
+		# Open the transaction lazily on the first statement so the write lock isn't held while idle.
+		if self._conn is not None and not self._conn.in_transaction:
+			self._begin_transaction()
 
+		if isinstance(values, dict):
+			query, bind = _bind_named_params(query, values)
+			return self._cursor.execute(query, bind)
+
+		query, values = _expand_positional_params(query, values)
 		return self._cursor.execute(query, values or ())
 
 	def sql(self, *args, **kwargs):
-		if args:
-			# since tuple is immutable
-			args = list(args)
-			args[0] = modify_query(args[0])
-			args = tuple(args)
-		elif kwargs.get("query"):
-			kwargs["query"] = modify_query(kwargs.get("query"))
+		# Query-builder SQL is already SQLite dialect (_skip_dialect_rewrite); only raw SQL needs rewriting.
+		if not kwargs.pop("_skip_dialect_rewrite", False):
+			if args:
+				args = (modify_query(args[0]), *args[1:])
+			elif kwargs.get("query"):
+				kwargs["query"] = modify_query(kwargs["query"])
 
 		return super().sql(*args, **kwargs)
+
+	def log_query(self, query, query_type, values=None, debug=False):
+		# Base class doesn't set last_query; capture it so frappe.db.last_query works on SQLite.
+		mogrified_query = super().log_query(query, query_type, values, debug)
+		self.last_query = mogrified_query
+		return mogrified_query
 
 	def sql_ddl(self, query, *args, **kwargs):
 		"""Execute DDL query."""
 		super().sql_ddl(query, *args, **kwargs)
 		self.commit()
 
-	def begin(self, *, read_only=False):
-		if read_only or frappe.flags.read_only:
+	def connect(self):
+		"""Connect, then open the request's transaction (see begin)."""
+		super().connect()
+		self.begin()
+
+	def _begin_transaction(self):
+		"""BEGIN IMMEDIATE for writable connections, DEFERRED for read-only ones."""
+		if self._conn.in_transaction:
+			return
+		# A read-only scope must not grab the write lock; a DEFERRED read is safe under WAL.
+		if self.read_only or frappe.flags.read_only:
+			self._cursor.execute("BEGIN DEFERRED")
+		else:
+			self._begin_immediate()
+
+	def _begin_immediate(self):
+		"""Acquire the write lock with BEGIN IMMEDIATE, retrying briefly on contention."""
+		import random
+		import time
+
+		# busy_timeout already blocks per attempt, so split it across retries; otherwise the
+		# worst-case wait would be retries x busy_timeout (e.g. 5 x 30s) before the error surfaces.
+		per_attempt = max(1, self.busy_timeout // self.WRITE_LOCK_RETRIES)
+		self._cursor.execute(f"PRAGMA busy_timeout = {per_attempt}")
+		try:
+			for attempt in range(self.WRITE_LOCK_RETRIES):
+				try:
+					self._cursor.execute("BEGIN IMMEDIATE")
+					return
+				except sqlite3.OperationalError as e:
+					if not self.is_deadlocked(e) or attempt == self.WRITE_LOCK_RETRIES - 1:
+						raise
+					time.sleep(random.uniform(0, 0.05 * (attempt + 1)))
+		finally:
+			self._cursor.execute(f"PRAGMA busy_timeout = {self.busy_timeout}")
+
+	def begin(self, *, read_only=None):
+		"""Switch connection mode if needed; read_only=None keeps the current mode."""
+		if read_only is None:
+			read_only = self.read_only
+		read_only = read_only or frappe.flags.read_only
+		if read_only != self.read_only:
 			if self._conn:
 				self._conn.close()
-			self._conn = self.get_connection(read_only=True)
+			self._conn = self.get_connection(read_only=read_only)
 			self._cursor = self._conn.cursor()
-			self.read_only = True
+			self.read_only = read_only
 
-		elif hasattr(self, "read_only") and self.read_only:
-			self._conn.close()
-			self._conn = self.get_connection()
-			self._cursor = self._conn.cursor()
-			self.read_only = False
+		# The transaction is opened lazily by execute_query() on the first statement, not here.
 
-		try:
-			self.sql("BEGIN")
-		except sqlite3.OperationalError as e:
-			if not self.is_nested_transaction_error(e):
-				raise e
+	def enter_read_only(self) -> bool:
+		"""Switch frappe.read_only() to the mode=ro connection; False if unsafe (already ro / writes pending)."""
+		if self.read_only or self.transaction_writes:
+			return False
+		self.begin(read_only=True)
+		return True
+
+	def exit_read_only(self):
+		"""Restore the writable connection after enter_read_only."""
+		self.begin(read_only=False)
 
 	def commit(self, chain=None):
 		"""Commit current transaction. Calls SQL `COMMIT`."""
@@ -529,9 +707,12 @@ class SQLiteDatabase(SQLiteExceptionUtil, Database):
 
 		self.before_commit.run()
 
-		self._conn.commit()
+		if self._conn.in_transaction:
+			self._conn.commit()
 		self.transaction_writes = 0
-		self.begin()  # explicitly start a new transaction
+		self.value_cache.clear()
+		# A transaction boundary ends any read-only scope; return to the writable connection.
+		self.begin(read_only=False)
 
 		self.after_commit.run()
 
@@ -547,12 +728,22 @@ class SQLiteDatabase(SQLiteExceptionUtil, Database):
 
 			self.before_rollback.run()
 
-			self._conn.rollback()
-			self.begin()
+			if self._conn.in_transaction:
+				self._conn.rollback()
+			self.value_cache.clear()
+			# See commit(): a transaction boundary ends any read-only scope.
+			self.begin(read_only=False)
 
 			self.after_rollback.run()
 		else:
 			warnings.warn(message=TRANSACTION_DISABLED_MSG, stacklevel=2)
+
+	@contextmanager
+	def unbuffered_cursor(self):
+		"""No-op for API compatibility: SQLite's cursor already reads rows lazily."""
+		if not self._conn:
+			self.connect()
+		yield
 
 	def get_db_table_columns(self, table) -> list[str]:
 		"""Return list of column names from given table."""
@@ -587,44 +778,305 @@ class SQLiteDatabase(SQLiteExceptionUtil, Database):
 		self.sql_ddl(f"DELETE FROM sqlite_sequence WHERE name='{table}'")
 
 	def check_implicit_commit(self, query: str, query_type: str):
-		if query_type in IMPLICIT_COMMIT_QUERY_TYPES and self.transaction_writes:
-			raise ImplicitCommitError("This statement can cause implicit commit", query)
+		# SQLite keeps DDL inside the transaction (no implicit commit), so nothing to check.
+		pass
 
 
-def modify_query(query):
-	"""
-	Modifies query according to the requirements of SQLite
-	"""
-	# Replace ` with " for definitions
+# modify_query() rewrites MariaDB SQL for SQLite: transpile via sqlglot (quoting, FOR UPDATE,
+# IF()->IIF() etc.), then a few AST passes for rewrites it has no rule for. DDL/PRAGMA skip the
+# parser (frappe already writes those SQLite-native, see schema.py) and only get backtick quoting.
+
+_DML_KEYWORDS = ("select", "update", "delete", "insert", "with")
+
+
+def _is_dml(query: str) -> bool:
+	"""Whether query opens with a DML keyword (through any leading whitespace/parens)."""
+	return query.lstrip(" \t\r\n(").lower().startswith(_DML_KEYWORDS)
+
+
+_INTERVAL_UNITS = {
+	"year": "years",
+	"years": "years",
+	"month": "months",
+	"months": "months",
+	"week": "days",
+	"weeks": "days",
+	"day": "days",
+	"days": "days",
+	"hour": "hours",
+	"hours": "hours",
+	"minute": "minutes",
+	"minutes": "minutes",
+	"second": "seconds",
+	"seconds": "seconds",
+}
+
+
+def _render_placeholder(self, node: exp.Placeholder) -> str:
+	"""Render a masked placeholder back to frappe's pyformat style (see _mask_placeholders)."""
+	name = node.this
+	return f"%({name})s" if name else "%s"
+
+
+# Scalar functions frappe registers per connection (see get_connection); keep in sync with it.
+_FRAPPE_UDF_NAMES = frozenset(
+	{
+		"now",
+		"regexp",
+		"regexp_replace",
+		"curdate",
+		"curtime",
+		"utc_timestamp",
+		"unix_timestamp",
+		"timestamp",
+		"to_seconds",
+		"timediff",
+		"hour",
+		"datediff",
+		"date_format",
+		"monthname",
+		"quarter",
+		"substring_index",
+		"month",
+		"year",
+		"day",
+		"dayofmonth",
+	}
+)
+
+
+class _FrappeMySQL(_MySQLDialect):
+	"""MariaDB dialect that reads both backtick- and doublequote-quoted names as identifiers
+	(query-builder SQL uses double quotes; frappe never emits a real double-quoted string)."""
+
+	class Tokenizer(_MySQLDialect.Tokenizer):
+		IDENTIFIERS: typing.ClassVar = ["`", '"']
+		QUOTES: typing.ClassVar = ["'"]
+
+	class Parser(_MySQLDialect.Parser):
+		# Parse our UDF names as anonymous calls so they reach our UDFs verbatim, not sqlglot's
+		# SQLite rewrites which are wrong or lossy (e.g. MONTHNAME -> STRFTIME('%B') -> NULL,
+		# DAYOFMONTH -> non-existent DAY_OF_MONTH(), DATE_FORMAT loses MariaDB specifiers).
+		FUNCTIONS: typing.ClassVar = {
+			name: parser
+			for name, parser in _MySQLDialect.Parser.FUNCTIONS.items()
+			if name.lower() not in _FRAPPE_UDF_NAMES
+		}
+
+
+def _render_regexp(self, node: exp.RegexpLike) -> str:
+	"""Render the native X REGEXP Y operator (our regexp UDF), not REGEXP_LIKE(x, y) which SQLite lacks."""
+	return f"{self.sql(node, 'this')} REGEXP {self.sql(node, 'expression')}"
+
+
+class _FrappeSQLite(_SQLiteDialect):
+	"""SQLite dialect emitting pyformat placeholders and the native REGEXP operator."""
+
+	class Generator(_SQLiteDialect.Generator):
+		TRANSFORMS: typing.ClassVar = {
+			**_SQLiteDialect.Generator.TRANSFORMS,
+			exp.Placeholder: _render_placeholder,
+			exp.RegexpLike: _render_regexp,
+		}
+
+
+def _mask_placeholders(query: str) -> str:
+	"""Mask pyformat placeholders so sqlglot can parse them: %(name)s -> :name, %s -> ?.
+	_render_placeholder restores them from the AST; placeholders inside literals are left alone."""
+
+	def mask(chunk: str) -> str:
+		return _PARAM_COMP.sub(r":\1", chunk).replace("%s", "?")
+
+	return "".join(chunk if is_literal else mask(chunk) for is_literal, chunk in _split_sql_literals(query))
+
+
+def _unwrap_top_level_subquery(tree: exp.Expression) -> exp.Expression:
+	"""Unwrap a whole-statement (SELECT ...) -> SELECT ...; MariaDB allows it, SQLite doesn't."""
+	if not isinstance(tree, exp.Subquery):
+		return tree
+	# Keep the wrapper if it owns ORDER BY / LIMIT / OFFSET -- those would be dropped.
+	if any(tree.args.get(k) for k in ("order", "limit", "offset")):
+		return tree
+	return tree.this
+
+
+def _strip_update_set_qualifiers(tree: exp.Expression) -> None:
+	"""Drop table qualifiers from UPDATE ... SET targets; SQLite rejects SET "tbl"."col" = val."""
+	if not isinstance(tree, exp.Update):
+		return
+	for assignment in tree.args.get("expressions", []):
+		target = assignment.this if isinstance(assignment, exp.EQ) else None
+		if isinstance(target, exp.Column):
+			target.set("table", None)
+
+
+def _is_now_like(node: exp.Expression) -> bool:
+	return isinstance(node, exp.CurrentTimestamp) or (
+		isinstance(node, exp.Anonymous) and str(node.this).upper() == "NOW"
+	)
+
+
+def _collapse_now_interval_arithmetic(tree: exp.Expression) -> None:
+	"""Fold NOW() +/- INTERVAL 'n' UNIT into datetime('now', '±n units'); SQLite has no INTERVAL type."""
+	for node in list(tree.find_all((exp.Sub, exp.Add))):
+		base, other = node.this, node.expression
+		if not _is_now_like(base) or not isinstance(other, exp.Interval):
+			continue
+
+		unit = str(other.args.get("unit")).lower()
+		# Only simple INTERVAL <int> <single-unit> forms map to a datetime() modifier; others pass through.
+		if unit not in _INTERVAL_UNITS:
+			continue
+		try:
+			n = int(str(other.this.this))
+		except ValueError:
+			continue
+		if unit in ("week", "weeks"):
+			n *= 7
+		sign = "-" if isinstance(node, exp.Sub) else "+"
+		modifier = f"{sign}{n} {_INTERVAL_UNITS[unit]}"
+		node.replace(exp.Datetime(this=exp.Literal.string("now"), expression=exp.Literal.string(modifier)))
+
+
+def _add_collate_nocase_to_orderby(tree: exp.Expression) -> None:
+	"""Add COLLATE NOCASE to plain-column ORDER BY so text sorts like MariaDB, not SQLite's BINARY."""
+	for select in tree.find_all(exp.Select):
+		order = select.args.get("order")
+		if not order:
+			continue
+		# Qualify a bare ORDER BY term to its output column first (SQLite errors "ambiguous" otherwise).
+		outputs = {}
+		for e in select.expressions:
+			col = e.this if isinstance(e, exp.Alias) else e
+			if isinstance(col, exp.Column):
+				outputs[e.alias_or_name.lower()] = col
+		for ordered in order.expressions:
+			target = ordered.this
+			if not isinstance(target, exp.Column) or target.find(exp.Collate):
+				continue
+			if not target.table:
+				out = outputs.get(target.name.lower())
+				if out is not None and out.table:
+					target = out.copy()
+					ordered.set("this", target)
+			ordered.set("this", exp.Collate(this=target.copy(), expression=exp.Var(this="NOCASE")))
+
+
+def _inline_having_aliases(tree: exp.Expression) -> None:
+	"""Inline aggregate SELECT aliases used bare in HAVING; SQLite resolves the bare name to a column."""
+	for select in tree.find_all(exp.Select):
+		having = select.args.get("having")
+		if not having:
+			continue
+		agg_map = {
+			item.alias_or_name.lower(): item.this
+			for item in select.expressions
+			if isinstance(item, exp.Alias) and isinstance(item.this, exp.AggFunc)
+		}
+		if not agg_map:
+			continue
+		for col in list(having.find_all(exp.Column)):
+			agg = None if col.table else agg_map.get(col.name.lower())
+			if agg is not None:
+				col.replace(agg.copy())
+
+
+def modify_query(query: str) -> str:
+	"""Rewrite a MariaDB-flavoured SQL query for SQLite compatibility. See the module comment
+	above for the overall approach."""
 	query = str(query)
-	query = query.replace("`", '"')
-	query = replace_locate_with_instr(query)
 
-	# Select from requires ""
-	if re.search("from tab", query, flags=re.IGNORECASE):
-		query = re.sub("from tab([a-zA-Z]*)", r'from "tab\1"', query, flags=re.IGNORECASE)
+	if not _is_dml(query):
+		return query.replace("`", '"')
 
-	return query
+	try:
+		tree = sqlglot.parse_one(_mask_placeholders(query), read=_FrappeMySQL)
+	except sqlglot.errors.ParseError:
+		# sqlglot can't parse it (rare); fall back to just identifier quoting.
+		return query.replace("`", '"')
 
+	tree = _unwrap_top_level_subquery(tree)
+	_strip_update_set_qualifiers(tree)
+	_collapse_now_interval_arithmetic(tree)
+	_inline_having_aliases(tree)
+	_add_collate_nocase_to_orderby(tree)
 
-def replace_locate_with_instr(query: str) -> str:
-	# instr is the locate equivalent in SQLite
-	if re.search(r"locate\(", query, flags=re.IGNORECASE):
-		query = re.sub(r"locate\(([^,]+),([^)]+)\)", r"instr(\2, \1)", query, flags=re.IGNORECASE)
-	return query
-
-
-def regexp(expr: str, item: str) -> bool:
-	"""
-	Define regexp implementation for SQLite manually
-
-	Although it works in the CLI - doesn't work through python
-	"""
-	return re.search(expr, item) is not None
+	return tree.sql(dialect=_FrappeSQLite)
 
 
-def regexp_replace(item: str, pattern: str, repl: str) -> str:
-	"""
-	Define regexp_replace implementation for SQLite
-	"""
-	return re.sub(pattern, repl, item)
+_POSITIONAL_PARAM = re.compile(r"%s")
+
+
+def _expand_sequence(value, bind_scalar) -> str:
+	"""Turn a bound value into placeholder text: scalar -> one placeholder, sequence -> "(a, b)",
+	empty -> "(NULL)". bind_scalar records one scalar and returns its placeholder."""
+	if not isinstance(value, list | tuple | set):
+		return bind_scalar(value)
+	if not value:
+		return "(NULL)"
+	return "(" + ", ".join(_expand_sequence(v, bind_scalar) for v in value) + ")"
+
+
+def _bind_named_params(query: str, values: dict):
+	"""Rewrite %(name)s placeholders to SQLite :name, expanding sequences (see _expand_sequence)."""
+	bind: dict = {}
+
+	def replace(match):
+		key = match.group(1)
+		if key not in values:
+			return match.group(0)
+
+		def bind_scalar(value):
+			# len(bind) keeps every generated name unique.
+			name = f"{key}_{len(bind)}"
+			bind[name] = value
+			return f":{name}"
+
+		return _expand_sequence(values[key], bind_scalar)
+
+	rewritten = "".join(
+		chunk if is_literal else _PARAM_COMP.sub(replace, chunk)
+		for is_literal, chunk in _split_sql_literals(query)
+	)
+	return rewritten, bind
+
+
+def _expand_positional_params(query: str, values):
+	"""Rewrite %s placeholders to SQLite ?, expanding sequences so "WHERE name IN %s" works."""
+
+	flat: list = []
+	values_iter = iter(())  # real iterator set once values are normalised, below
+
+	def substitute_only(q):
+		# Plain %s -> ? with no sequence expansion; the fallback.
+		return "".join(
+			chunk if is_literal else chunk.replace("%s", "?") for is_literal, chunk in _split_sql_literals(q)
+		)
+
+	def bind_scalar(value):
+		flat.append(value)
+		return "?"
+
+	def replace(_match):
+		# Each %s, left to right, takes the next value; a sequence expands to several ? binds.
+		return _expand_sequence(next(values_iter), bind_scalar)
+
+	if not values:
+		return substitute_only(query), values
+
+	if not isinstance(values, list | tuple):
+		values = (values,)
+
+	# One value per placeholder; if the counts disagree, don't guess -- just substitute.
+	placeholder_count = sum(
+		chunk.count("%s") for is_literal, chunk in _split_sql_literals(query) if not is_literal
+	)
+	if placeholder_count != len(values):
+		return substitute_only(query), values
+
+	values_iter = iter(values)
+	rewritten = "".join(
+		chunk if is_literal else _POSITIONAL_PARAM.sub(replace, chunk)
+		for is_literal, chunk in _split_sql_literals(query)
+	)
+	return rewritten, flat

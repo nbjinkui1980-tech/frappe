@@ -23,6 +23,7 @@ Requests via FrappeClient are also handled here.
 
 
 @frappe.whitelist()
+@frappe.read_only()
 def get_list(
 	doctype: str,
 	fields: str | list[str | dict[str, Any]] | None = None,
@@ -75,6 +76,7 @@ def get_list(
 
 
 @frappe.whitelist()
+@frappe.read_only()
 def get_count(
 	doctype: str,
 	filters: str | list | dict[str, Any] | None = None,
@@ -91,6 +93,7 @@ def get_count(
 
 
 @frappe.whitelist()
+@frappe.read_only()
 def get(
 	doctype: str,
 	name: str | int | None = None,
@@ -117,6 +120,7 @@ def get(
 
 
 @frappe.whitelist()
+@frappe.read_only()
 def get_value(
 	doctype: str,
 	fieldname: str | list[str] | dict[str, Any],
@@ -172,6 +176,7 @@ def get_value(
 
 
 @frappe.whitelist()
+@frappe.read_only()
 def get_single_value(doctype: str, field: str):
 	if not frappe.has_permission(doctype):
 		frappe.throw(_("No permission for {0}").format(_(doctype)), frappe.PermissionError)
@@ -326,6 +331,7 @@ def bulk_update(docs: str | list):
 
 
 @frappe.whitelist()
+@frappe.read_only()
 def has_permission(doctype: str, docname: str | int, perm_type: str = "read"):
 	"""Return a JSON with data whether the document has the requested permission.
 
@@ -337,6 +343,7 @@ def has_permission(doctype: str, docname: str | int, perm_type: str = "read"):
 
 
 @frappe.whitelist()
+@frappe.read_only()
 def get_doc_permissions(doctype: str, docname: str | int):
 	"""Return an evaluated document permissions dict like `{"read":1, "write":1}`.
 
@@ -348,6 +355,7 @@ def get_doc_permissions(doctype: str, docname: str | int):
 
 
 @frappe.whitelist()
+@frappe.read_only()
 def get_password(doctype: str, name: str | int, fieldname: str):
 	"""Return a password type property. Only applicable for System Managers
 
@@ -364,7 +372,8 @@ from frappe.deprecation_dumpster import get_js as _get_js
 get_js = frappe.whitelist()(_get_js)
 
 
-@frappe.whitelist(allow_guest=True)
+@frappe.whitelist(allow_guest=True)  # nosemgrep
+@frappe.read_only()
 def get_time_zone():
 	"""Return the default time zone."""
 	return {"time_zone": frappe.defaults.get_defaults().get("time_zone")}
@@ -416,6 +425,7 @@ def attach_file(
 
 
 @frappe.whitelist()
+@frappe.read_only()
 @http_cache(max_age=10 * 60)
 def is_document_amended(doctype: str, docname: str | int):
 	if frappe.permissions.has_permission(doctype):
@@ -443,8 +453,9 @@ def validate_link_and_fetch(
 	meta = frappe.get_meta(doctype)
 	fields_to_fetch = frappe.parse_json(fields_to_fetch)
 
-	# only cache is no fields to fetch and request is GET
-	can_cache = not fields_to_fetch and frappe.request.method == "GET"
+	# only cache if no fields to fetch and request is GET (may run outside a request context)
+	request = getattr(frappe.local, "request", None)
+	can_cache = not fields_to_fetch and bool(request) and request.method == "GET"
 
 	# Use search_widget to validate - ensures filters/custom queries are respected
 	# in addition to standard permission checks

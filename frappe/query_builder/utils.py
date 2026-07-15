@@ -4,13 +4,19 @@ from enum import Enum
 from importlib import import_module
 from typing import Any, get_type_hints
 
-from pypika.queries import Column, QueryBuilder, _SetOperation
+# The query-builder patches below (QueryBuilder.run, Base.max, ...) are intentional; the
+# monkey-patching rule anchors on these imports, so suppress it here at the match start.
+from pypika.queries import (  # nosemgrep: frappe-monkey-patching-not-allowed
+	Column,
+	QueryBuilder,
+	_SetOperation,
+)
 from pypika.terms import PseudoColumn
 
 import frappe
 from frappe.query_builder.terms import NamedParameterWrapper
 
-from .builder import Base, MariaDB, Postgres, SQLite
+from .builder import Base, MariaDB, Postgres, SQLite  # nosemgrep: frappe-monkey-patching-not-allowed
 
 
 class PseudoColumnMapper(PseudoColumn):
@@ -42,7 +48,15 @@ class ImportMapper:
 
 	def __call__(self, *args: Any, **kwds: Any) -> Callable:
 		db = db_type_is(frappe.conf.db_type)
-		return self.func_map[db](*args, **kwds)
+		func = self.func_map.get(db)
+		if func is None and db is db_type_is.SQLITE:
+			# Many builder functions have no dedicated SQLite mapping. SQLite is the
+			# closest dialect to MariaDB (and the SQLite driver shims MariaDB's scalar
+			# functions), so fall back to the MariaDB form instead of raising KeyError.
+			func = self.func_map.get(db_type_is.MARIADB)
+		if func is None:
+			func = self.func_map[db]  # surface the original KeyError
+		return func(*args, **kwds)
 
 
 class BuilderIdentificationFailed(Exception):
@@ -163,7 +177,10 @@ def execute_query(query, *args, **kwargs):
 	fields = query.__dict__.get("_fields_list", [])
 	child_queries = query._child_queries
 	query, params = prepare_query(query)
-	result = frappe.local.db.sql(query, params, *args, **kwargs)  # nosemgrep
+	# The query is already generated in the connected backend's dialect (pypika picks the
+	# dialect via get_query_builder), so the SQLite backend must not re-transpile it. Other
+	# backends accept and ignore this flag.
+	result = frappe.local.db.sql(query, params, *args, _skip_dialect_rewrite=True, **kwargs)  # nosemgrep
 
 	if child_queries and isinstance(child_queries, list) and result:
 		execute_child_queries(child_queries, result)

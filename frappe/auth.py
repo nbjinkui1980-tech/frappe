@@ -460,6 +460,7 @@ class CookieManager:
 
 
 @frappe.whitelist()
+@frappe.read_only()
 def get_logged_user():
 	return frappe.session.user
 
@@ -480,9 +481,8 @@ def validate_ip_address(user):
 	Certain methods called from our socketio backend need direct access, and so the IP is not
 	checked for those
 	"""
-	if hasattr(frappe.local, "request") and frappe.local.request.path.startswith(
-		"/api/method/frappe.realtime."
-	):
+	request = getattr(frappe.local, "request", None)
+	if request and request.path.startswith("/api/method/frappe.realtime."):
 		return True
 
 	user_info = frappe.get_cached_doc("User", user)

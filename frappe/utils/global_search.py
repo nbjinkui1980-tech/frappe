@@ -406,6 +406,16 @@ def sync_values(values: list):
 	GlobalSearch = frappe.qb.Table("__global_search")
 	conflict_fields = ["content", "published", "title", "route"]
 
+	if frappe.db.db_type == "sqlite":
+		# __global_search is an FTS5 virtual table with no unique key to upsert against, so
+		# emulate the upsert by dropping any existing rows for each (doctype, name) first.
+		values = list(values)
+		for value in values:
+			frappe.db.delete("__global_search", {"doctype": value[0], "name": value[1]})
+		if values:
+			frappe.qb.into(GlobalSearch).columns(["doctype", "name", *conflict_fields]).insert(*values).run()
+		return
+
 	query = frappe.qb.into(GlobalSearch).columns(["doctype", "name", *conflict_fields]).insert(*values)
 
 	if frappe.db.db_type == "postgres":
@@ -476,6 +486,42 @@ def delete_for_document(doc):
 	frappe.db.delete("__global_search", {"doctype": doc.doctype, "name": doc.name})
 
 
+def _sqlite_fts_search(word: str, doctype: str, allowed_doctypes, limit: int, start: int):
+	"""Full-text search against the SQLite FTS5 __global_search table.
+
+	FTS5 uses ``<table> MATCH '<query>'`` rather than MariaDB's MATCH ... AGAINST, and exposes a
+	built-in ``bm25()`` score (more negative = better match). The MariaDB path returns a positive
+	relevance and the caller keeps only rows with ``rank > 0``, so return ``-bm25()`` here."""
+	tokens = re.findall(r"\w+", word)
+	if not tokens:
+		return []
+
+	# prefix match each token, mirroring the MariaDB '+word*' boolean-mode query
+	params = {"q": " ".join(f"{token}*" for token in tokens)}
+	conditions = ['"__global_search" MATCH %(q)s']
+
+	if doctype:
+		conditions.append("doctype = %(doctype)s")
+		params["doctype"] = doctype
+	else:
+		doctypes = list(allowed_doctypes)
+		if not doctypes:
+			# `doctype IN ()` is a syntax error; callers guard this, but keep the helper self-safe.
+			return []
+		conditions.append("doctype IN ({})".format(", ".join(f"%(dt{i})s" for i in range(len(doctypes)))))
+		params.update({f"dt{i}": dt for i, dt in enumerate(doctypes)})
+
+	offset = f"OFFSET {cint(start)}" if cint(start) > 0 else ""
+	query = (
+		'SELECT doctype, name, content, -bm25("__global_search") AS rank '
+		'FROM "__global_search" '
+		f"WHERE {' AND '.join(conditions)} "
+		f'ORDER BY bm25("__global_search") LIMIT {cint(limit)} {offset}'
+	)
+	# Query is already SQLite-native (FTS5 MATCH, bm25(), quoted identifiers); don't re-transpile it.
+	return frappe.db.sql(query, params, as_dict=True, _skip_dialect_rewrite=True)
+
+
 @frappe.whitelist()
 def search(text: str, start: int = 0, limit: int = 20, doctype: str = ""):
 	"""
@@ -500,6 +546,10 @@ def search(text: str, start: int = 0, limit: int = 20, doctype: str = ""):
 	for word in set(text.split("&")):
 		word = word.strip()
 		if not word:
+			continue
+
+		if frappe.db.db_type == "sqlite":
+			results.extend(_sqlite_fts_search(word, doctype, allowed_doctypes, limit, start))
 			continue
 
 		global_search = frappe.qb.Table("__global_search")
@@ -574,15 +624,29 @@ def web_search(text: str, scope: str | None = None, start: int = 0, limit: int =
 			f"to_tsvector('english', \"content\") @@ plainto_tsquery('english', {frappe.db.escape(text)})"
 		)
 
+		# FTS5 matches via `<table> MATCH`; published is stored as an integer.
+		sqlite_scope = "`route` LIKE %(scope)s AND " if scope else ""
+		sqlite_conditions = f"`published` = 1 AND {sqlite_scope}`__global_search` MATCH %(fts_query)s"
+
+		# Bare FTS5 tokens only; a raw fallback would be parsed as a MATCH expression and could
+		# raise on stray operators, so skip empty terms instead.
+		fts_tokens = re.findall(r"\w+", text)
+		if not fts_tokens:
+			continue
+
 		values = {"scope": "".join([scope, "%"]) if scope else "", "limit": limit, "start": start}
+		values["fts_query"] = " ".join(f"{token}*" for token in fts_tokens)
 
 		result = frappe.db.multisql(
 			{
 				"mariadb": common_query.format(conditions=mariadb_conditions),
 				"postgres": common_query.format(conditions=postgres_conditions),
+				"sqlite": common_query.format(conditions=sqlite_conditions),
 			},
 			values=values,
 			as_dict=True,
+			# The sqlite variant is FTS5-native (MATCH); don't re-transpile it. Ignored by other backends.
+			_skip_dialect_rewrite=True,
 		)
 		tmp_result = []
 		for i in result:

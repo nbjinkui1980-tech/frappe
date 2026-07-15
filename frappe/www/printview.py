@@ -309,6 +309,7 @@ def convert_markdown(doc: "Document") -> None:
 
 
 @frappe.whitelist()
+@frappe.read_only()
 def get_html_and_style(
 	doc: str | dict,
 	name: str | None = None,
@@ -363,6 +364,7 @@ def get_html_and_style(
 
 
 @frappe.whitelist()
+@frappe.read_only()
 def get_rendered_raw_commands(
 	doc: str | dict, name: str | None = None, print_format: str | None = None
 ) -> dict:
