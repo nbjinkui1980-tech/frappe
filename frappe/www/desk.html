@@ -21,6 +21,8 @@
 			href="{{ favicon or "/assets/frappe/images/frappe-favicon.svg" }}" type="image/x-icon">
 		<link rel="icon"
 			href="{{ favicon or "/assets/frappe/images/frappe-favicon.svg" }}" type="image/x-icon">
+		{{ island_import_map() }}
+
 		{% for include in app_include_css -%}
 		{{ include_style(include) }}
 		{%- endfor -%}

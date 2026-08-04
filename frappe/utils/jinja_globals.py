@@ -144,6 +144,17 @@ def include_style(path, rtl=None, preload=True):
 	return f'<link type="text/css" rel="stylesheet" href="{path}">'
 
 
+def island_import_map():
+	"""Get the import map that links island modules to the shared island runtime.
+
+	Empty unless an app declares islands. Must be rendered before any module
+	script, so it belongs in the page head.
+	"""
+	from frappe.utils.island import get_import_map_tag
+
+	return get_import_map_tag()
+
+
 def bundled_asset(path, rtl=None):
 	from frappe.utils import get_assets_json
 	from frappe.website.utils import abs_url
