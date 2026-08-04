@@ -33,6 +33,16 @@ def get_ui_islands() -> dict[str, str]:
 	return islands
 
 
+def strip_runtime_keys(assets_json: dict[str, str]) -> dict[str, str]:
+	"""assets.json without its `.runtime.js` entries.
+
+	Boot embeds this in every desk page; the import map (below) is the only
+	reader of `.runtime.js` keys, and desk already inlines that map, so boot
+	would otherwise carry the same ~400 entries twice.
+	"""
+	return {key: url for key, url in assets_json.items() if not key.endswith(RUNTIME_JS_SUFFIX)}
+
+
 def get_import_map() -> dict[str, dict[str, str]]:
 	"""The runtime import map: every bare specifier in the closure -> its hashed file.
 

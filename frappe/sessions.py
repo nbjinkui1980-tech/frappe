@@ -25,7 +25,7 @@ from frappe.utils import cint, cstr, get_assets_json
 from frappe.utils.change_log import has_app_update_notifications
 from frappe.utils.dashboard_renderer import get_insights_rendered_doctype
 from frappe.utils.data import add_to_date
-from frappe.utils.island import get_ui_islands
+from frappe.utils.island import get_ui_islands, strip_runtime_keys
 
 
 @frappe.whitelist()
@@ -165,7 +165,7 @@ def get():
 		bootinfo["metadata_version"] = reset_metadata_version()
 
 	bootinfo.notes = get_unseen_notes()
-	bootinfo.assets_json = get_assets_json()
+	bootinfo.assets_json = strip_runtime_keys(get_assets_json())
 	bootinfo.ui_islands = get_ui_islands()
 	bootinfo.insights_rendered_doctype = get_insights_rendered_doctype()
 	bootinfo.read_only = bool(frappe.flags.read_only)
