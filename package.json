@@ -1,8 +1,9 @@
 {
   "name": "frappe-framework",
   "scripts": {
-    "build": "node esbuild",
-    "production": "node esbuild --production",
+    "build": "node island/build.mjs",
+    "production": "node island/build.mjs --production",
+    "build:runtime": "node island/build-runtime.mjs",
     "watch": "node esbuild --watch",
     "coverage:report": "npx nyc report --reporter=clover"
   },
