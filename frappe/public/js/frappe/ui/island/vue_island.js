@@ -15,6 +15,11 @@ import { current_theme, on_theme_change } from "./theme.js";
 
 const RUNTIME_CSS_KEY = "island_runtime.css";
 
+// Desk's modal tier (Bootstrap's `.modal`), which is where an island's dialogs
+// and popovers belong: above every page-level control desk paints — the icon
+// rail at 1020, menus and dropdowns at 1030 — and level with a desk dialog.
+const ISLAND_OVERLAY_Z_INDEX = "1050";
+
 // A global symbol, so the shell needs no static frappe-ui import — which it
 // could not have anyway, living in a classic desk bundle.
 const PORTAL_TARGET_KEY = Symbol.for("frappe-ui:portal-target");
@@ -87,6 +92,14 @@ export async function mount_vue_island(el, options) {
 	// would be queried against the document and never match.
 	const portal = document.createElement("div");
 	portal.className = "frappe-island-portal";
+	// A shadow root is not a stacking context, so an overlay inside it competes
+	// with desk's chrome directly. At `z-index: auto` it loses to the icon rail
+	// (1020) and desk's menus (1030) and gets painted under them, even though it
+	// covers them for hit testing. The portal carries the tier instead of the
+	// host, so only overlays are raised and the island's own content stays in
+	// the page flow.
+	portal.style.position = "relative";
+	portal.style.zIndex = ISLAND_OVERLAY_Z_INDEX;
 
 	shadow_root.append(root, portal);
 
