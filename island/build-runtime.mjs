@@ -45,6 +45,7 @@ import {
   rootSpecifiers,
 } from "./runtime-config.mjs";
 import { distDir, writeRuntimeAssets } from "./assets.mjs";
+import deskFonts from "./postcss-desk-fonts.mjs";
 import rootToHost from "./postcss-root-to-host.mjs";
 
 const require = createRequire(import.meta.url);
@@ -293,6 +294,7 @@ function packageConfig(pkg, entries, { discover = false } = {}) {
               ...(isFrappeUi ? [tailwindcss(TAILWIND_CONFIG)] : []),
               autoprefixer,
               rootToHost,
+              deskFonts,
             ],
       },
     },
@@ -388,6 +390,7 @@ async function runPostcss(source) {
     tailwindcss(TAILWIND_CONFIG),
     autoprefixer,
     rootToHost,
+    deskFonts,
   ]).process(source, { from: path.join(FRAPPE_UI_DIR, "src/style.css") });
   return result.css;
 }

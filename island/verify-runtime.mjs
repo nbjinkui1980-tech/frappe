@@ -204,6 +204,17 @@ function verifyStylesheet(file) {
     !/[};]\s*(html|body)\s*[{,]/.test(css),
     "runtime stylesheet still targets html/body"
   );
+  // Desk registers Inter as `InterVariable` and `Inter`. frappe-ui's own name
+  // for the same typeface matches no registered face, so a survivor means the
+  // island renders in the system font.
+  check(
+    !/InterVar(?![\w-])/.test(css),
+    "runtime stylesheet still asks for InterVar, a family desk does not register"
+  );
+  check(
+    /font-family:[^;}]*InterVariable/.test(css),
+    "runtime stylesheet names none of desk's font families"
+  );
 }
 
 /**
