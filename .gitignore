@@ -12,6 +12,8 @@ frappe/docs/current
 .vscode
 .vs
 node_modules
+# linked frappe-ui checkout, until the island runtime installs it from npm
+frappe-ui/
 .kdev4/
 *.kdev4
 *debug.log

@@ -51,6 +51,7 @@
     "frappe-datatable": "1.20.7",
     "frappe-gantt": "^1.2.1",
     "frappe-quill-image-resize": "^3.0.9",
+    "frappe-ui": "link:./frappe-ui",
     "highlight.js": "^10.4.1",
     "html5-qrcode": "^2.3.8",
     "jquery": "3.7.0",
@@ -77,9 +78,19 @@
     "socket.io": "^4.7.1",
     "socket.io-client": "^4.7.1",
     "sortablejs": "^1.15.0",
-    "vue": "^3.3.0",
+    "vue": "^3.5.0",
+    "vue-router": "^4.6.0",
     "vuedraggable": "^4.1.0",
     "yargs": "^17.5.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^6.0.7",
+    "autoprefixer": "^10.4.13",
+    "es-module-lexer": "^1.7.0",
+    "semver": "^7.6.0",
+    "tailwindcss": "^3.4.0",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.2"
   },
   "nyc": {
     "report-dir": ".cypress-coverage"
