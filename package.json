@@ -4,6 +4,7 @@
     "build": "node island/build.mjs",
     "production": "node island/build.mjs --production",
     "build:runtime": "node island/build-runtime.mjs",
+    "verify:runtime": "node island/verify-runtime.mjs",
     "watch": "node esbuild --watch",
     "coverage:report": "npx nyc report --reporter=clover"
   },
