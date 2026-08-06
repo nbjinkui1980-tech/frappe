@@ -20,6 +20,13 @@ frappe.provide("frappe.dashboards.chart_sources");
 
 const ISLAND = "insights.dashboard";
 
+// Set on <body> while the island renderer is the one on screen. It is what
+// `dashboard_view.scss` keys the bounded page shell off — see the comment there
+// for why the shell stops document-scrolling on this page. The legacy renderer
+// below grows with its widgets and must keep the scroll it has always had, so
+// the route alone cannot say it.
+const ISLAND_PAGE_CLASS = "dashboard-view-island-page";
+
 frappe.pages["dashboard-view"].on_page_load = function (wrapper) {
 	const page = frappe.ui.make_app_page({
 		parent: wrapper,
@@ -81,6 +88,7 @@ class InsightsDashboard {
 
 	show(reference) {
 		this.root.show();
+		document.body.classList.add(ISLAND_PAGE_CLASS);
 
 		// Desk registers a page's breadcrumb once, keyed by the route it was opened
 		// on, so the head goes blank the moment the route moves inside the page.
@@ -122,6 +130,7 @@ class InsightsDashboard {
 
 	hide() {
 		this.root.hide();
+		document.body.classList.remove(ISLAND_PAGE_CLASS);
 		this.reference = null;
 		this.handle?.unmount();
 		this.handle = null;

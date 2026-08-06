@@ -76,6 +76,12 @@ export async function mount_vue_island(el, options) {
 
 	const shadow_host = document.createElement("div");
 	shadow_host.className = "frappe-island";
+	// An island fills the element it is mounted into: the host bounds the box,
+	// the island lays out inside it. Two elements sit between the two — this
+	// host and the root below — and a percentage height only chains through if
+	// both carry it. Against an auto-height target this resolves to auto, so an
+	// island that grows with its content is unchanged.
+	shadow_host.style.height = "100%";
 	target.appendChild(shadow_host);
 	const shadow_root = shadow_host.attachShadow({ mode: "open" });
 
@@ -84,6 +90,7 @@ export async function mount_vue_island(el, options) {
 	// not on :host, which no descendant combinator can reach.
 	const root = document.createElement("div");
 	root.className = "frappe-island-root";
+	root.style.height = "100%";
 
 	// Overlays (Dialog, Popover, Select, …) portal here rather than to <body>,
 	// so they render inside the styled, encapsulated tree. reka-ui resolves its
