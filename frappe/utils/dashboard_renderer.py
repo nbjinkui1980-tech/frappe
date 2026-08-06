@@ -8,14 +8,9 @@ side for a while and every condition behind that choice lives here.
 The flag gates rendering surfaces only — Insights' own app, its content and the
 island plumbing ignore it, and Insights knows none of this.
 
-The flag gates rendering surfaces only. Insights' own app at `/insights`, its
-content, and the island plumbing (the `ui_islands` registry, the import map, and
-`frappe.ui.mount_island`) ignore it. Insights declares its islands
-unconditionally and knows none of this.
-
-Retirement: in v17 the body of `get_dashboard_renderer` collapses to
-`return INSIGHTS`, and the bridge is then deleted along with its call sites. No
-Insights release is needed at either step.
+Retirement: in v17 `get_dashboard_renderer` collapses to `return INSIGHTS`, and
+the bridge is then deleted with its call sites. No Insights release is needed at
+either step.
 """
 
 import frappe
@@ -50,11 +45,31 @@ def get_dashboard_renderer(doctype: str) -> str:
 	return INSIGHTS
 
 
+@frappe.whitelist()
+def get_renderer_for_reference(reference: str) -> str:
+	"""Which renderer draws the dashboard a desk route names.
+
+	Framework answers for its own content and stops there, so legacy wins a
+	collision and every link written before this route keeps pointing where it
+	did. Insights owns resolving its own reference — logical id, slug or docname —
+	and owns the state a reference naming nothing lands on.
+	"""
+	# The bare route names no dashboard. Picking one is the legacy page's own flow.
+	if not reference:
+		return LEGACY
+
+	if get_dashboard_renderer(INSIGHTS_DASHBOARD_DOCTYPE) == LEGACY:
+		return LEGACY
+
+	return LEGACY if frappe.db.exists("Dashboard", reference) else INSIGHTS
+
+
 def get_insights_rendered_doctype() -> str | None:
 	"""The doctype desk renders with Insights, or `None` when the bridge is off.
 
-	Boot carries this instead of the raw conditions, so the client bridge stays a
-	comparison and no page can reassemble the decision from parts.
+	Boot carries this rather than the raw conditions, so no page can reassemble
+	the decision from parts, and a site without the bridge answers on the client
+	with no round trip.
 	"""
 	return (
 		INSIGHTS_DASHBOARD_DOCTYPE if get_dashboard_renderer(INSIGHTS_DASHBOARD_DOCTYPE) == INSIGHTS else None

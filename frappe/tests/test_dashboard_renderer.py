@@ -13,6 +13,7 @@ from frappe.utils.dashboard_renderer import (
 	SITE_FLAG,
 	get_dashboard_renderer,
 	get_insights_rendered_doctype,
+	get_renderer_for_reference,
 )
 
 
@@ -60,6 +61,33 @@ class TestDashboardRenderer(IntegrationTestCase):
 			self.assertEqual(get_dashboard_renderer("Workspace"), LEGACY)
 			self.assertEqual(get_dashboard_renderer(""), LEGACY)
 
+	def test_a_reference_naming_a_legacy_dashboard_keeps_the_legacy_renderer(self):
+		# Only the name is looked up, so the dashboard needs no charts.
+		dashboard = frappe.get_doc(doctype="Dashboard", dashboard_name=frappe.generate_hash()).insert(
+			ignore_mandatory=True
+		)
+		with site(installed=True, flag=True):
+			self.assertEqual(get_renderer_for_reference(dashboard.name), LEGACY)
+
+	def test_any_other_reference_goes_to_insights_unresolved(self):
+		# Framework does not look a reference up in Insights, so a slug, a logical
+		# id and a reference that names nothing all answer the same: Insights, which
+		# is what resolves it and what draws the nothing-there state.
+		with site(installed=True, flag=True):
+			for reference in ("sales-performance", "insights/sales-performance", "no-such-thing"):
+				with self.subTest(reference=reference):
+					self.assertEqual(get_renderer_for_reference(reference), INSIGHTS)
+
+	def test_the_bare_route_gets_the_legacy_renderer(self):
+		# `/app/dashboard-view` names no dashboard; picking one is the legacy flow.
+		with site(installed=True, flag=True):
+			self.assertEqual(get_renderer_for_reference(""), LEGACY)
+
+	def test_a_reference_gets_the_legacy_renderer_while_the_bridge_is_off(self):
+		for installed, flag in ((True, False), (False, True), (False, False)):
+			with self.subTest(installed=installed, flag=flag), site(installed=installed, flag=flag):
+				self.assertEqual(get_renderer_for_reference("sales-performance"), LEGACY)
+
 	def test_boot_names_the_doctype_insights_renders(self):
 		with site(installed=True, flag=True):
 			self.assertEqual(get_insights_rendered_doctype(), INSIGHTS_DASHBOARD_DOCTYPE)
@@ -70,8 +98,9 @@ class TestDashboardRenderer(IntegrationTestCase):
 				self.assertIsNone(get_insights_rendered_doctype())
 
 	def test_bridge_reaches_the_browser_through_boot(self):
-		# The client resolver is a comparison against this field, so boot has to
-		# carry it -- and outside the boot cache, so flipping the flag lands.
+		# The client half answers from this field alone while the bridge is off, so
+		# boot has to carry it -- and outside the boot cache, so flipping the flag
+		# lands.
 		frappe.local.request = None
 		self.addCleanup(lambda: delattr(frappe.local, "request"))
 
