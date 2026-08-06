@@ -86,6 +86,7 @@
     "yargs": "^17.5.1"
   },
   "devDependencies": {
+    "@tailwindcss/container-queries": "^0.1.1",
     "@vitejs/plugin-vue": "^6.0.7",
     "autoprefixer": "^10.4.13",
     "es-module-lexer": "^1.7.0",

@@ -58,12 +58,18 @@ if (failures.length) {
 console.log("\n[island] preset verified");
 
 async function run() {
-  await buildIslands({
+  const island = {
     app: "fixtureapp",
     root: bench.frontend,
     entries: { [ENTRY]: "src/islands/panel.js" },
     production: true,
-  });
+    tailwindPlugins: ["@tailwindcss/container-queries"],
+    // Stands in for a class the runtime sheet already carries: the fixture uses
+    // `p-3`, and an island that declares it downstairs must not re-ship it.
+    blocklist: ["p-3"],
+  };
+
+  await buildIslands(island);
 
   const assets = JSON.parse(fs.readFileSync(bench.assetsJson, "utf-8"));
   const js = read(assets, `${ENTRY}.island.js`);
@@ -110,6 +116,15 @@ async function run() {
     "no frappe-ui utility or token dump",
     `${kb(css.raw)} total`
   );
+  check(
+    /container-type:\s*inline-size/.test(css.text),
+    "the app's Tailwind plugins run"
+  );
+  check(
+    /@container[^{]*\{[^}]*grid-template-columns:\s*repeat\(3/.test(css.text),
+    "a container-query variant compiles"
+  );
+  check(!css.text.includes(".p-3"), "a blocklisted class is left out");
 
   console.log("\nmeasured");
   console.log(`  JS   ${kb(js.raw)} raw / ${kb(js.gzip)} gzip`);
@@ -119,13 +134,7 @@ async function run() {
   const budget = js.raw + css.raw - 1;
   let failed = false;
   try {
-    await buildIslands({
-      app: "fixtureapp",
-      root: bench.frontend,
-      entries: { [ENTRY]: "src/islands/panel.js" },
-      production: true,
-      budget,
-    });
+    await buildIslands({ ...island, budget });
   } catch (error) {
     failed = /over the/.test(error.message);
   }
@@ -146,8 +155,8 @@ function stageBench() {
 
   fs.mkdirSync(path.dirname(assetsJson), { recursive: true });
   fs.cpSync(FIXTURE, frontend, { recursive: true });
-  // Borrowed, not installed: vue, frappe-ui and the build tooling all live in
-  // the tree the preset itself ships from.
+  // Borrowed, not installed: vue, frappe-ui, the build tooling and the Tailwind
+  // plugin the fixture names all live in the tree the preset ships from.
   fs.symlinkSync(
     path.join(FRAMEWORK_ROOT, "node_modules"),
     path.join(frontend, "node_modules")

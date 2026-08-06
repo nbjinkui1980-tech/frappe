@@ -50,6 +50,8 @@ const TAILWIND_ENTRY = "virtual:island.css";
  * @param {Object<string,string>} options.entries  asset base name → entry file
  * @param {number} [options.budget]  bytes of JS + CSS per entry; over it fails the build
  * @param {string[]} [options.content]  Tailwind globs, relative to `root`
+ * @param {string[]} [options.tailwindPlugins]  the app's Tailwind plugins, by module specifier
+ * @param {string[]} [options.blocklist]  classes the runtime sheet already carries
  * @param {(string|RegExp)[]} [options.forbiddenImports]  escape hatch: fail on a matching import
  * @param {import('vite').PluginOption[]} [options.plugins]  extra plugins
  * @param {boolean} [options.production]
@@ -95,7 +97,7 @@ export function islandContext(options) {
 		mode: options.production ? "production" : "development",
 		budget: options.budget ?? DEFAULT_BUDGET,
 		closure: runtimeClosure(paths.assetsJsonPath),
-		tailwind: writeIslandTailwindConfig(root, options.content),
+		tailwind: writeIslandTailwindConfig(root, options),
 	};
 }
 
