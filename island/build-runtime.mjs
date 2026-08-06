@@ -103,13 +103,23 @@ async function main() {
 /**
  * Decide how one import crosses a package boundary, and record the target.
  *
- * The import map is flat: one bare specifier, one file. So when two copies of a
- * package are installed, one of them cannot have a specifier. The rule is a
- * single question — does the copy already in the closure satisfy the range the
- * importer declares?
+ * The import map is flat: one bare specifier, one file. Every crossing
+ * therefore asks two questions, in this order:
  *
- *   yes → link to it (the usual case; that is what dedupe means)
- *   no  → bundle the second copy into the importer, where it needs no specifier
+ *   1. Does the copy node resolution hands *this importer* satisfy the range
+ *      the importer declares? If not, the installed tree contradicts its own
+ *      manifests and no answer chosen here can be right, so the build stops.
+ *   2. Is that copy the one the closure already publishes? If it is not, and
+ *      the published copy does not satisfy the importer either, the second copy
+ *      is bundled into the importer, where it needs no specifier.
+ *
+ * Question 1 used to be asked only when the two copies differed, and that made
+ * the worst case the silent one. When hoisting hands the importer the *same*
+ * wrong copy the closure already publishes, there is no second directory to
+ * notice: the build links happily and the skew surfaces in the browser as
+ * "does not provide an export named …". That is how a stale frappe-ui
+ * node_modules published @vueuse/shared@10.11.1 to a reka-ui that declares
+ * ^14.1.0 — one specifier, two versions, and no build error.
  *
  * Duplicating leaf utility code is what every consumer bundler already does.
  * Duplicating Vue is not, so for singletons the second copy is a build error.
@@ -124,43 +134,62 @@ function linkSpecifier(specifier, fromDir) {
     return "link";
   }
 
+  const owner = owningPackageDir(fromDir);
+  // No declared range means an undeclared dependency found by hoisting luck.
+  // There is nothing to reconcile against, so keep it shared.
+  const range = declaredRange(owner, name);
+  const reachable = readPackageJson(resolvedDir).version;
+  if (range && !semver.satisfies(reachable, range))
+    throw new Error(
+      `island: ${describe(
+        owner
+      )} declares ${name}@${range}, but the only copy ` +
+        `node resolution reaches from it is ${name}@${reachable} ` +
+        `(${relative(resolvedDir)}), so that is the copy every consumer of ` +
+        `${name} would get. A node_modules that has drifted from its lockfile ` +
+        `is the usual cause, and \`yarn install --check-files\` is the only ` +
+        `mode that re-reads what is on disk.`
+    );
+
   let pkg = packages.get(name);
   if (!pkg) {
     pkg = {
       name,
       dir: resolvedDir,
       resolveFrom: fromDir,
-      version: readPackageJson(resolvedDir).version,
+      version: reachable,
       entries: new Set(),
       scanned: new Set(),
     };
     packages.set(name, pkg);
-  } else if (pkg.dir !== resolvedDir) {
-    const owner = owningPackageDir(fromDir);
-    const range = declaredRange(owner, name);
-    // An undeclared dependency was found by hoisting luck — keep it shared.
-    if (range && !semver.satisfies(pkg.version, range)) {
-      const version = readPackageJson(resolvedDir).version;
-      if (isSingleton(name)) {
-        throw new Error(
-          `island: ${path.basename(
-            owner
-          )} needs ${name}@${range} but the closure ` +
-            `carries ${name}@${pkg.version}, and ${name} must exist exactly once. ` +
-            `Align the versions in package.json.`
-        );
-      }
-      conflicts.add(
-        `${name}@${version} bundled into ${readPackageJson(owner).name}` +
-          ` (needs ${range}, closure has ${pkg.version})`
+  } else if (
+    pkg.dir !== resolvedDir &&
+    range &&
+    !semver.satisfies(pkg.version, range)
+  ) {
+    if (isSingleton(name))
+      throw new Error(
+        `island: ${describe(owner)} needs ${name}@${range} but the closure ` +
+          `carries ${name}@${pkg.version}, and ${name} must exist exactly once. ` +
+          `Align the versions in package.json.`
       );
-      return "inline";
-    }
+    conflicts.add(
+      `${name}@${reachable} bundled into ${readPackageJson(owner).name}` +
+        ` (needs ${range}, closure has ${pkg.version})`
+    );
+    return "inline";
   }
 
   pkg.entries.add(subpath);
   return "link";
 }
+
+const describe = (dir) => {
+  const { name, version } = readPackageJson(dir);
+  return version ? `${name}@${version}` : name;
+};
+
+const relative = (dir) => path.relative(REPO_ROOT, dir) || ".";
 
 /** Walk the import graph to a fixed point. */
 async function discoverClosure() {

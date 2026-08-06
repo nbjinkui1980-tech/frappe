@@ -55,6 +55,7 @@ async function main() {
 
   verifyRegistration(registered);
   const emitted = verifyModules(registered, specifiers);
+  verifyExports(emitted, registered);
   verifyNoInlining(emitted);
   verifyStylesheet(localPath(assets[CSS_KEY]));
   verifyImportMapLoads();
@@ -130,6 +131,133 @@ function verifyModules(registered, specifiers) {
   }
 
   return emitted;
+}
+
+/**
+ * Every name a file imports across the map is a name its target exports.
+ *
+ * verifyModules proves the map can *resolve* a bare specifier. It cannot prove
+ * the resolution is the right version: when the closure publishes one version
+ * of a package to a consumer built against another, every specifier still
+ * resolves and the page dies at import with "does not provide an export named
+ * …". That is the one skew a flat import map cannot make visible on its own, so
+ * it gets checked against the artifacts rather than trusted from the manifests
+ * the closure walk reads.
+ */
+function verifyExports(emitted, registered) {
+  for (const file of emitted) {
+    const mod = moduleOf(file);
+    if (!mod) continue;
+
+    for (const record of mod.imports) {
+      if (record.d !== -1 || !record.n) continue; // dynamic, or `import.meta`
+      const statement = mod.source.slice(record.ss, record.s);
+      if (/^export\s*\*\s*from/.test(statement)) continue; // no names of its own
+
+      const names = requestedNames(statement);
+      if (!names?.length) continue; // side-effect or namespace import
+
+      const target = targetFile(record.n, file, registered);
+      if (!target || !fs.existsSync(target)) continue; // resolution is elsewhere
+      const exported = exportsOf(target, registered);
+      for (const name of names)
+        check(
+          exported.has(name),
+          `${short(file)}: imports "${name}" from "${record.n}", which the ` +
+            `import map resolves to a module that does not export it ` +
+            `(${short(target)})`
+        );
+    }
+  }
+}
+
+/**
+ * The names one static import or re-export asks its target for, or null when
+ * the statement takes whatever is there (`import * as ns`).
+ *
+ * Read off the statement text because es-module-lexer reports the module a
+ * statement names, not the bindings it takes. Rollup emits these, so the shapes
+ * are the four it generates and not the whole grammar.
+ */
+function requestedNames(statement) {
+  const from = statement.lastIndexOf("from");
+  if (from === -1) return []; // `import "x"`, imported for effect alone
+  const clause = statement.slice(0, from);
+  if (clause.includes("*")) return null;
+
+  const names = [];
+  const braces = clause.match(/\{([^}]*)\}/);
+  const outside = clause
+    .replace(/^(import|export)\s*/, "")
+    .replace(/\{[^}]*\}/, "")
+    .replace(/,/g, "")
+    .trim();
+  if (outside) names.push("default");
+  for (const part of braces?.[1].split(",") ?? []) {
+    const name = part
+      .trim()
+      .split(/\s+as\s+/)[0]
+      .trim();
+    if (name) names.push(name);
+  }
+  return names;
+}
+
+/**
+ * What a module exports, following `export * from` through the map — `vue`
+ * re-exports @vue/runtime-dom that way, and @vueuse/core re-exports
+ * @vueuse/shared. A worklist rather than recursion because those chains are
+ * allowed to be cyclic.
+ */
+function exportsOf(root, registered) {
+  const cached = exportNames.get(root);
+  if (cached) return cached;
+
+  const names = new Set();
+  const seen = new Set();
+  const queue = [root];
+
+  while (queue.length) {
+    const file = queue.pop();
+    if (!file || seen.has(file) || !fs.existsSync(file)) continue;
+    seen.add(file);
+
+    const mod = moduleOf(file);
+    if (!mod) continue;
+    for (const record of mod.exports) names.add(record.n);
+    for (const record of mod.imports) {
+      if (record.d !== -1 || !record.n) continue;
+      if (!/^export\s*\*\s*from/.test(mod.source.slice(record.ss, record.s)))
+        continue;
+      queue.push(targetFile(record.n, file, registered));
+    }
+  }
+
+  exportNames.set(root, names);
+  return names;
+}
+
+const targetFile = (specifier, importer, registered) =>
+  isBareSpecifier(specifier)
+    ? registered.get(specifier)
+    : path.resolve(path.dirname(importer), specifier);
+
+const modules = new Map();
+const exportNames = new Map();
+
+/** Parsed once. Null on failure — verifyModules has already reported it. */
+function moduleOf(file) {
+  if (modules.has(file)) return modules.get(file);
+  let mod = null;
+  try {
+    const source = fs.readFileSync(file, "utf-8");
+    const [imports, exports] = parse(source, file);
+    mod = { source, imports, exports };
+  } catch {
+    mod = null;
+  }
+  modules.set(file, mod);
+  return mod;
 }
 
 /** Spot-check that Vue's runtime is not copied into any other package. */

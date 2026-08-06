@@ -8,6 +8,7 @@ import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 
 const require = createRequire(import.meta.url);
+const semver = require("semver");
 
 export const REPO_ROOT = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -118,7 +119,14 @@ export function owningPackageDir(fromDir) {
   }
 }
 
-/** The semver range a package declares for one of its dependencies. */
+/**
+ * The semver range a package declares for one of its dependencies, or null when
+ * it declares nothing the build can reconcile against.
+ *
+ * A declaration is not always a range: `link:./frappe-ui` and `git+https://…`
+ * name a location instead, and there is exactly one copy a location can mean.
+ * Null for those, so a caller checking a range never has to know the protocols.
+ */
 export function declaredRange(ownerDir, name) {
   if (!ownerDir) return null;
   let manifest;
@@ -127,12 +135,12 @@ export function declaredRange(ownerDir, name) {
   } catch {
     return null;
   }
-  return (
+  const declared =
     manifest.dependencies?.[name] ??
     manifest.peerDependencies?.[name] ??
     manifest.optionalDependencies?.[name] ??
-    null
-  );
+    null;
+  return declared && semver.validRange(declared) ? declared : null;
 }
 
 /**
