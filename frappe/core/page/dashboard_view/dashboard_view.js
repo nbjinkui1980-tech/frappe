@@ -34,6 +34,17 @@ frappe.pages["dashboard-view"].on_page_load = function (wrapper) {
 		single_column: true,
 	});
 
+	// This route draws no page head by default. The island renders its own header
+	// inside its own tree, and desk's would be a second, emptier one above it —
+	// off from the start rather than off once the bridge answers, because that
+	// answer is a round trip on a site that has Insights and the head would sit
+	// on screen for all of it. The legacy renderer asks for it back when it draws.
+	//
+	// The page itself stays: the body sidebar and the workspace dock resolve
+	// their visibility against it, so a route with no page would lose the app
+	// frame too.
+	page.toggle_page_head(false);
+
 	// A container per renderer, both made up front: the legacy renderer empties
 	// what it is given, so the two must never share a parent they draw into.
 	const content = $(wrapper).find(".page-content").empty();
@@ -66,11 +77,15 @@ frappe.pages["dashboard-view"].on_page_load = function (wrapper) {
 
 /**
  * The Insights renderer: one container the `insights.dashboard` island renders
- * into. The island owns the whole body — the title row, the filter bar, the
- * grid, and every state, including the quiet one it shows when the reference
- * resolves to nothing. The reference is handed over as the route wrote it: a
- * reference can span segments (`insights/sales-performance`), and what one
- * names is Insights' to resolve, never desk's to parse.
+ * into. The island owns the whole page — its own header (breadcrumbs, title,
+ * freshness, actions), the filter bar, the grid, and every state, including the
+ * quiet one it shows when the reference resolves to nothing. Desk's page head is
+ * hidden while it is on screen, so the page has one header rather than an empty
+ * one above a full one.
+ *
+ * The reference is handed over as the route wrote it: a reference can span
+ * segments (`insights/sales-performance`), and what one names is Insights' to
+ * resolve, never desk's to parse.
  */
 class InsightsDashboard {
 	constructor(container, page) {
@@ -90,18 +105,13 @@ class InsightsDashboard {
 		this.root.show();
 		document.body.classList.add(ISLAND_PAGE_CLASS);
 
-		// Desk registers a page's breadcrumb once, keyed by the route it was opened
-		// on, so the head goes blank the moment the route moves inside the page.
-		// Re-stating it is the shell's whole title story — the island draws the
-		// dashboard's own name. The menu belongs to whichever renderer is on screen,
-		// so the legacy one's entries go with it.
+		// The head is off for this route already. What it used to carry here was
+		// worse than what the island says in its own header anyway: a generic
+		// "Dashboard" title (the real one arrives with the island's fetch) and a
+		// breadcrumb that went blank whenever the route moved inside the page.
+		// The menu belongs to whichever renderer is on screen, so the legacy
+		// one's entries go when it leaves.
 		this.page.clear_menu();
-		this.page.set_title(__("Dashboard"));
-		frappe.breadcrumbs.add({
-			type: "Custom",
-			label: __("Dashboard"),
-			route: frappe.get_route_str(),
-		});
 
 		if (this.handle || this.mounting) {
 			if (reference === this.reference) return;
@@ -149,6 +159,9 @@ class Dashboard {
 
 	show() {
 		this.root.show();
+		// widgets, a page title and a breadcrumb: this renderer draws into desk's
+		// head, so it asks for it back.
+		this.page.toggle_page_head(true);
 		this.route = frappe.get_route();
 		this.set_breadcrumbs();
 		if (this.route.length > 1) {

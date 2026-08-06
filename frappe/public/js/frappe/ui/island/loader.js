@@ -101,6 +101,25 @@ function build_host() {
 		timezone: boot.time_zone?.user || boot.time_zone?.system || null,
 		user: frappe.session?.user || boot.user?.name || null,
 		base_url: frappe.urllib ? frappe.urllib.get_base_url() : window.location.origin,
+
+		// Where the reader came from. An island that draws its own page header
+		// needs a parent crumb in it, and desk's breadcrumbs are page-head markup
+		// (`page.html`) that such a page does not draw — so the trail reaches the
+		// island as data or it is lost. Ancestors only: the island's own page is
+		// the island's to name.
+		breadcrumbs: entry_breadcrumbs(),
+
+		// Desk routing, which an island cannot do for itself: a click inside a
+		// shadow root is retargeted to the island's host element, so desk's
+		// anchor delegation never matches it and a plain link would reload the
+		// whole page.
+		navigate: (route) => frappe.set_route(route),
+
+		// Naming the browser tab, for an island that is the whole page. Through
+		// desk rather than by assigning `document.title`: desk keeps the unread
+		// count as a title prefix over a remembered original, and an island
+		// writing the title behind its back would have that original put back.
+		set_title: (title) => frappe.utils.set_title(title),
 	};
 
 	// Live: desk flips the theme mid-session. Reading the DOM keeps this correct
@@ -112,6 +131,34 @@ function build_host() {
 	});
 
 	return host;
+}
+
+/**
+ * The one ancestor desk can vouch for: the workspace the reader was on
+ * immediately before this page. Only the previous route counts — the rule
+ * `frappe.breadcrumbs.set_workspace` already follows — because a workspace
+ * further back is a parent the reader never came through. No workspace behind
+ * us means no crumb: a cold link shows the page's own name and nothing else,
+ * which beats inventing a parent.
+ */
+function entry_breadcrumbs() {
+	const previous = frappe.route_history?.slice(-2)[0];
+	if (!previous || previous[0] !== "Workspaces") return [];
+
+	const is_private = previous[1] === "private";
+	const name = is_private ? previous[2] : previous[1];
+	if (!name) return [];
+
+	const workspace = frappe.workspaces?.[frappe.router.slug(name)];
+	return [
+		{
+			label: __(workspace?.title || name),
+			// The path form, not the ["Workspaces", slug] standard route: it is
+			// what carries a private workspace's prefix, and it is how the
+			// sidebar routes to a workspace page.
+			route: frappe.router.slug(is_private ? `private/${name}` : name),
+		},
+	];
 }
 
 /**
