@@ -17,8 +17,6 @@
  * The caller passes `{ props, on }`; framework injects `host` and `styles`.
  */
 
-import { current_theme } from "./theme.js";
-
 const ISLAND_JS_SUFFIX = ".island.js";
 const ISLAND_CSS_SUFFIX = ".island.css";
 
@@ -91,8 +89,8 @@ function resolve_island(name) {
 
 /**
  * The ambient context every island receives. The caller never assembles it, so
- * an island honors desk's theme, language and timezone with no per-island
- * wiring.
+ * an island honors desk's language and timezone with no per-island wiring.
+ * `theme` is not here: the shell adds it, where it can be a tracked read.
  */
 function build_host() {
 	const boot = frappe.boot || {};
@@ -121,14 +119,6 @@ function build_host() {
 		// writing the title behind its back would have that original put back.
 		set_title: (title) => frappe.utils.set_title(title),
 	};
-
-	// Live: desk flips the theme mid-session. Reading the DOM keeps this correct
-	// for any consumer; the shell re-points it at a Vue ref so templates track it.
-	Object.defineProperty(host, "theme", {
-		configurable: true,
-		enumerable: true,
-		get: () => current_theme(),
-	});
 
 	return host;
 }

@@ -142,9 +142,11 @@ export async function mount_vue_island(el, options) {
 			apply_theme(next);
 		});
 
-		// The loader's `host.theme` reads the DOM, which is correct but not tracked.
-		// Re-point it at a ref now that Vue is here, so a mid-session theme switch
-		// re-renders the island.
+		// Theme joins the host here rather than where the rest of it is assembled:
+		// desk flips it mid-session, and only past the Vue import can it be a
+		// tracked read, so a switch re-renders the island instead of being seen
+		// once at mount. A getter, because the host is handed out by reference and
+		// every consumer reads it after this point.
 		Object.defineProperty(host, "theme", {
 			configurable: true,
 			enumerable: true,
