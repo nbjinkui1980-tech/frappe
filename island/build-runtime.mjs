@@ -22,7 +22,7 @@ import zlib from "node:zlib";
 import crypto from "node:crypto";
 import { createRequire } from "node:module";
 import { build } from "vite";
-import vue from "@vitejs/plugin-vue";
+import { islandVue } from "../ui/vite/island/vue.js";
 import postcss from "postcss";
 import {
   APP,
@@ -327,7 +327,10 @@ function packageConfig(pkg, entries, { discover = false } = {}) {
             ],
       },
     },
-    plugins: [...(isFrappeUi ? [lucide, vue()] : []), closureExternals(pkg)],
+    plugins: [
+      ...(isFrappeUi ? [lucide, islandVue()] : []),
+      closureExternals(pkg),
+    ],
     build: {
       outDir,
       emptyOutDir: false,

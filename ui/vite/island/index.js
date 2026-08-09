@@ -10,7 +10,7 @@ import path from "node:path";
 import zlib from "node:zlib";
 import { createRequire } from "node:module";
 import { build } from "vite";
-import vue from "@vitejs/plugin-vue";
+import { islandVue } from "./vue.js";
 import { lucideIconsPlugin } from "frappe-ui/vite/lucideIconsPlugin";
 import {
 	benchPaths,
@@ -142,7 +142,7 @@ export function islandConfig(name, entryFile, context) {
 			...(context.forbiddenImports?.length
 				? [forbiddenImports(context.forbiddenImports)]
 				: []),
-			vue(),
+			islandVue(),
 			emitIsland(name, context.budget, context.paths),
 			...(context.plugins ?? []),
 		],
