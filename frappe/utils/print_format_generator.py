@@ -6,6 +6,7 @@ from typing import ClassVar
 
 import frappe
 from frappe import _
+from frappe.utils.data import cint
 from frappe.utils.jinja_globals import is_rtl
 
 
@@ -36,25 +37,18 @@ def download_pdf(
 	letterhead: str | None = None,
 	settings: str | dict | None = None,
 ):
-	from frappe.printing.doctype.print_format.classic_converter import (
-		get_default_print_format,
-		uses_beta_renderer,
-	)
-	from frappe.www.printview import set_link_titles, validate_print
+	from frappe.www.printview import resolve_print_format, set_link_titles, validate_print
 
 	doc = frappe.get_doc(doctype, name)
 	validate_print(doc)
 	set_link_titles(doc)
-	if not print_format or print_format == "Standard":
-		print_format = get_default_print_format(doctype)
-	else:
-		pf_doc = frappe.get_doc("Print Format", print_format)
-		if not uses_beta_renderer(pf_doc):
-			# jinja formats have no layout for the generator — hand off to the
-			# legacy pipeline, which reads the format's template
-			from frappe.utils.print_format import download_pdf as download_jinja_pdf
+	print_format, is_beta = resolve_print_format(print_format, doc.meta)
+	if not is_beta:
+		# jinja formats have no layout for the generator — hand off to the
+		# legacy pipeline, which reads the format's template
+		from frappe.utils.print_format import download_pdf as download_jinja_pdf
 
-			return download_jinja_pdf(doctype, name, format=print_format, letterhead=letterhead)
+		return download_jinja_pdf(doctype, name, format=print_format.name, letterhead=letterhead)
 	generator = PrintFormatGenerator(print_format, doc, letterhead, settings=frappe.parse_json(settings))
 	pdf = generator.render_pdf()
 
@@ -218,12 +212,15 @@ def get_html(
 	style=None,
 	trigger_print=False,
 	settings=None,
+	no_letterhead=None,
 ):
 	from frappe.www.printview import validate_print
 
 	doc = frappe.get_doc(doctype, name)
 	validate_print(doc)
-	generator = PrintFormatGenerator(print_format, doc, letterhead, style=style, settings=settings)
+	generator = PrintFormatGenerator(
+		print_format, doc, letterhead, style=style, settings=settings, no_letterhead=no_letterhead
+	)
 	return generator.get_html_preview(action_banner=action_banner, trigger_print=trigger_print)
 
 
@@ -241,8 +238,11 @@ class PrintFormatGenerator:
 		"bottom_right": "right",
 	}
 	_FIELD_RENDERERS: ClassVar[dict[str, str]] = {"HTML Editor": "HTML", "Markdown Editor": "Markdown"}
+	JUSTIFY_MODES: ClassVar[frozenset[str]] = frozenset(
+		{"space-between", "space-evenly", "center", "right-end"}
+	)
 
-	def __init__(self, print_format, doc, letterhead=None, style=None, settings=None):
+	def __init__(self, print_format, doc, letterhead=None, style=None, settings=None, no_letterhead=None):
 		self.print_format = (
 			print_format
 			if not isinstance(print_format, str)
@@ -253,14 +253,37 @@ class PrintFormatGenerator:
 		self.settings_override = settings or {}
 		self._header_absorbs_top_margin = False
 		self._logged_conditions = set()
-
-		if letterhead == _("No Letterhead"):
-			letterhead = None
-		self.letterhead = frappe.get_doc("Letter Head", letterhead) if letterhead else None
+		self.letterhead = None
 
 		self.build_context()
 		self.layout = self.get_layout(self.print_format)
 		self.context.layout = self.layout
+		self.letterhead = self.get_letterhead(letterhead, no_letterhead)
+		self.context.letterhead = self.letterhead
+
+	def get_letterhead(self, letterhead, no_letterhead):
+		"""Resolve the letter head to print, most specific choice first.
+
+		Mirrors ``printview.get_letter_head`` so a builder format prints the same
+		letter head a template one would, and adds the format's own choice: a layout
+		that names a letter head outranks the document's field. ``no_letterhead``
+		left unset falls back to the Print Settings toggle, as templates do.
+		"""
+		if no_letterhead is None:
+			no_letterhead = not cint(self.print_settings.with_letterhead)
+		if cint(no_letterhead) or letterhead == _("No Letterhead"):
+			return None
+
+		name = (
+			letterhead
+			or (self.layout or {}).get("letter_head")
+			or self.doc.get("letter_head")
+			or frappe.db.get_value("Letter Head", {"is_default": 1}, "name")
+		)
+		# a stale link shouldn't fail the render — templates degrade to no letter head too
+		if not name or not frappe.db.exists("Letter Head", name):
+			return None
+		return frappe.get_doc("Letter Head", name)
 
 	def build_context(self):
 		self.print_settings = frappe.get_doc("Print Settings")
@@ -475,11 +498,12 @@ class PrintFormatGenerator:
 		return "\n".join(parts) or None
 
 	_ZONE_SECTION_TEMPLATE = """\
+{%- set justify_classes = {'space-between': 'row-col-space-between', 'space-evenly': 'row-col-space-evenly', 'center': 'row-col-center', 'right-end': 'row-col-right-end'} -%}
 {%- set ns = namespace(has_fields=false) -%}
 {%- for col in section.columns -%}{%- for df in col.get('fields', []) -%}{%- set ns.has_fields = true -%}{%- endfor -%}{%- endfor -%}
 {%- if ns.has_fields -%}
 {%- set col_gap = (section.gap if section.gap is defined and section.gap is not none else 20)|string + 'px' -%}
-<div class="section section-columns row" style="gap:{{ col_gap }}">
+<div class="section section-columns row {{ justify_classes.get(section.get('justify'), '') }}" style="gap:{{ col_gap }}">
 {%- for column in section.columns %}
 <div class="column col"{% if column.get('width') %} style="flex: {{ column.get('width')|float }} 1 0%"{% endif %}>
 {%- for df in column.get('fields', []) -%}
@@ -487,7 +511,7 @@ class PrintFormatGenerator:
 {%- if df.fieldtype == 'HTML' and df.html -%}
 <div class="custom-html">{{ frappe.render_template(df.html, {'doc': doc}) }}</div>
 {%- elif df.fieldtype == 'Spacer' -%}
-<div style="height:12px"></div>
+<div style="height:{{ (df.height|int|string + 'px') if df.get('height') else '1em' }}"></div>
 {%- elif df.fieldtype == 'Divider' -%}
 <hr style="border-top:1px solid #e5e7eb;margin:4px 0"/>
 {%- elif df.fieldtype == 'Image' -%}
@@ -577,7 +601,11 @@ class PrintFormatGenerator:
 				for col in zone.get("columns") or []
 				if isinstance(col, dict)
 			]
-			return {**zone, "columns": columns}
+			cleaned = {**zone, "columns": columns}
+			# justify names a CSS class, so only the modes we ship may reach the markup
+			if cleaned.get("justify") not in self.JUSTIFY_MODES:
+				cleaned.pop("justify", None)
+			return cleaned
 
 		def clean_field(df):
 			if "table_columns" not in df:
