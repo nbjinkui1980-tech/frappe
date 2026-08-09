@@ -104,7 +104,7 @@ What the preset does, and the options that change it:
 
 | | |
 | --- | --- |
-| **Externals** | The runtime closure stays bare (`vue`, `frappe-ui`, `echarts`, …), read from the runtime's own `assets.json` registration — see [ADR-0008](docs/adr/0008-island-externals-come-from-the-runtime-registration-not-a-second-walk.md). Build the runtime first (`bench build --app frappe`). |
+| **Externals** | The runtime closure stays bare (`vue`, `frappe-ui`, `frappe-ui/charts`, `echarts/core`, …), read from the runtime's own `assets.json` registration — see [ADR-0008](docs/adr/0008-island-externals-come-from-the-runtime-registration-not-a-second-walk.md). Build the runtime first (`bench build --app frappe`); a registration that does not publish every entry the installed frappe-ui exports **fails the build**, because linking against a stale one silently bundles what it fails to name. |
 | **CSS** | One extracted stylesheet per island: Tailwind scanning `content` (default `src/**/*.{vue,js,ts,jsx,tsx,html}`), no preflight and no base layer (the runtime sheet carries both), `:root`/`html`/`body` rewritten to `:host`, dark mode on `[data-theme="dark"]`. |
 | **Icons** | `~icons/lucide/<name>` works, through frappe-ui's resolver. |
 | **Budget** | `budget` bytes of JS + CSS per entry, default 256 kB; over it **fails the build**. Pin it to your own first clean build plus slack. `forbiddenImports` is an optional app-local escape hatch. |

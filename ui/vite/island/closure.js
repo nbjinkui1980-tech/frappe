@@ -2,8 +2,11 @@
 //
 // Read back from the `.runtime.js` keys the runtime build registered, so the
 // runtime build, the import map and this preset cannot drift. Why it is read
-// rather than derived: ../../docs/adr/0008-island-externals-come-from-the-runtime-registration-not-a-second-walk.md
+// rather than derived, and why the reader checks it is current:
+// ../../docs/adr/0008-island-externals-come-from-the-runtime-registration-not-a-second-walk.md
 
+import fs from "node:fs";
+import path from "node:path";
 import { readAssetsJson } from "./bench.js";
 
 const RUNTIME_KEY_SUFFIX = ".runtime.js";
@@ -29,6 +32,85 @@ export function runtimeClosure(assetsJsonPath) {
 		);
 
 	return specifiers;
+}
+
+/**
+ * frappe-ui's browser-facing entry points, read off its `exports` map.
+ *
+ * The runtime build seeds its walk with these, and `assertClosureIsCurrent`
+ * checks the registration against them, so what frappe-ui offers a page is
+ * written down once. Its build-time exports (Tailwind preset, vite plugins,
+ * vitepress theme) are node code and never reach a page; a wildcard names no
+ * fixed entry.
+ *
+ * @param {string} frappeUiDir
+ * @returns {string[]}
+ */
+export function frappeUiEntries(frappeUiDir) {
+	const manifest = JSON.parse(fs.readFileSync(path.join(frappeUiDir, "package.json"), "utf-8"));
+	const buildTimeOnly = /^\.\/(tailwind|vite|vitepress)/;
+	const entries = [];
+
+	for (const [subpath, target] of Object.entries(manifest.exports ?? {})) {
+		if (subpath.includes("*") || buildTimeOnly.test(subpath)) continue;
+		const file = typeof target === "string" ? target : target.import || target.default;
+		if (!file || !/\.(js|ts)$/.test(file)) continue;
+		entries.push(path.posix.join("frappe-ui", subpath.replace(/^\.\/?/, "")));
+	}
+
+	return entries;
+}
+
+/**
+ * The package directory node resolution reaches, walking up from `fromDir`.
+ * By hand rather than through `require.resolve`, because many packages do not
+ * export `./package.json` and the answer wanted is the directory.
+ */
+export function resolvePackageDir(name, fromDir) {
+	let dir = path.resolve(fromDir);
+	for (;;) {
+		const candidate = path.join(dir, "node_modules", name);
+		if (fs.existsSync(path.join(candidate, "package.json"))) return fs.realpathSync(candidate);
+		const parent = path.dirname(dir);
+		if (parent === dir) return null;
+		dir = parent;
+	}
+}
+
+/**
+ * Refuse a registration that is behind the frappe-ui on disk.
+ *
+ * assets.json proves the registration is consistent with itself, not that it is
+ * current. One written before frappe-ui grew an entry names every specifier the
+ * runtime knew about and none of the ones it did not — and the preset reads
+ * that silence as "outside the closure", so it bundles the entry and everything
+ * behind it. That is how a chart island came to carry its own echarts: the
+ * runtime published `frappe-ui`, the island imported `frappe-ui/charts`, and
+ * nothing but the size budget objected, at 4.5x over.
+ *
+ * The entry set is the one thing about the closure that is declared rather than
+ * walked, so it is the one thing this side can check without redoing the walk
+ * ADR 0008 rejects. Deeper drift — frappe-ui reaching for a new subpath of a
+ * package it already uses — stays the warning's job.
+ *
+ * @param {Set<string>} closure
+ * @param {string} root  the app's vite root, which resolves its own frappe-ui
+ */
+export function assertClosureIsCurrent(closure, root) {
+	// An island that does not build on frappe-ui has nothing to compare.
+	const frappeUiDir = resolvePackageDir("frappe-ui", root);
+	if (!frappeUiDir) return;
+
+	const missing = frappeUiEntries(frappeUiDir).filter((entry) => !closure.has(entry));
+	if (!missing.length) return;
+
+	throw new Error(
+		`island: the island runtime does not publish ${missing.join(", ")}, ` +
+			`which the frappe-ui at ${frappeUiDir} exports. Its registration is ` +
+			"behind that tree, so an island importing one of these would bundle " +
+			"its own copy of everything behind it rather than borrow the page's. " +
+			"Rebuild the runtime with `bench build --app frappe`."
+	);
 }
 
 /** `@tiptap/pm/state` → `{ name: "@tiptap/pm", subpath: "state" }`. */

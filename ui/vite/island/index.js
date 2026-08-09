@@ -20,7 +20,7 @@ import {
 	notifyRebuild,
 	writeIslandAssets,
 } from "./bench.js";
-import { closureExternals, runtimeClosure } from "./closure.js";
+import { assertClosureIsCurrent, closureExternals, runtimeClosure } from "./closure.js";
 import { writeIslandTailwindConfig } from "./tailwind.js";
 import rootToHost from "./root-to-host.js";
 
@@ -89,6 +89,8 @@ export function islandContext(options) {
 	// through a symlink would never match the entry it resolves to.
 	const root = fs.realpathSync(path.resolve(options.root));
 	const paths = benchPaths(findBenchRoot(root), options.app);
+	const closure = runtimeClosure(paths.assetsJsonPath);
+	assertClosureIsCurrent(closure, root);
 
 	return {
 		...options,
@@ -96,7 +98,7 @@ export function islandContext(options) {
 		paths,
 		mode: options.production ? "production" : "development",
 		budget: options.budget ?? DEFAULT_BUDGET,
-		closure: runtimeClosure(paths.assetsJsonPath),
+		closure,
 		tailwind: writeIslandTailwindConfig(root, options),
 	};
 }

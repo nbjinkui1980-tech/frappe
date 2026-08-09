@@ -6,6 +6,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
+import { frappeUiEntries } from "../ui/vite/island/closure.js";
 
 const require = createRequire(import.meta.url);
 const semver = require("semver");
@@ -42,32 +43,13 @@ export const specifierFromAssetKey = (key) =>
  * everything frappe-ui drags in" — so these three are the only names written
  * down anywhere. Everything else is discovered from the import graph, with the
  * installed tree (and therefore yarn.lock) as the version authority.
+ *
+ * frappe-ui's entries come from the island preset, which checks a registration
+ * against the same list — one definition, so an entry this build skips cannot
+ * read as an entry the closure does not have.
  */
 export function rootSpecifiers() {
-  return ["vue", "vue-router", ...frappeUiEntrySpecifiers()];
-}
-
-/**
- * frappe-ui's browser-facing entry points, read off its `exports` map. Its
- * build-time exports (tailwind preset, vite plugins, vitepress theme) are node
- * code and never reach a page; `./drive/*` is a wildcard with no fixed entry.
- */
-function frappeUiEntrySpecifiers() {
-  const { exports: exportsMap } = readPackageJson(FRAPPE_UI_DIR);
-  const buildTimeOnly = /^\.\/(tailwind|vite|vitepress)/;
-  const specifiers = [];
-
-  for (const [subpath, target] of Object.entries(exportsMap || {})) {
-    if (subpath.includes("*") || buildTimeOnly.test(subpath)) continue;
-    const file =
-      typeof target === "string" ? target : target.import || target.default;
-    if (!file || !/\.(js|ts)$/.test(file)) continue;
-    specifiers.push(
-      path.posix.join("frappe-ui", subpath.replace(/^\.\/?/, ""))
-    );
-  }
-
-  return specifiers;
+  return ["vue", "vue-router", ...frappeUiEntries(FRAPPE_UI_DIR)];
 }
 
 export function readPackageJson(dir) {

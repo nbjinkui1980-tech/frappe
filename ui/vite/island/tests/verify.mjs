@@ -6,14 +6,15 @@
  * it, and reads the output back. What it checks is the contract the loader and
  * the mount helper depend on — bare closure imports, a stylesheet holding only
  * the app's own utilities with nothing document-scoped left in it, assets.json
- * keys in the `.island.js` / `.island.css` form, and a budget that actually
- * fails a build.
+ * keys in the `.island.js` / `.island.css` form, a budget that actually fails a
+ * build, and a stale registration that does too.
  *
  * A plain node script, like island/verify-runtime.mjs next door, because what
  * is under test is a build pipeline and not a unit.
  *
- * Prerequisite: the island runtime must be built — the preset reads the closure
- * out of assets.json. Run `bench build --app frappe` first.
+ * Prerequisite: the island runtime must be built, and built from the frappe-ui
+ * on disk — the preset reads the closure out of assets.json and refuses one
+ * that is behind that tree. Run `bench build --app frappe` first.
  *
  * Usage:
  *   node ui/vite/island/tests/verify.mjs
@@ -25,6 +26,7 @@ import zlib from "node:zlib";
 import { fileURLToPath } from "node:url";
 import { buildIslands } from "../index.js";
 import { findBenchRoot } from "../bench.js";
+import { frappeUiEntries, resolvePackageDir } from "../closure.js";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const FIXTURE = path.join(HERE, "fixture");
@@ -132,13 +134,56 @@ async function run() {
 
   console.log("\nsize budget");
   const budget = js.raw + css.raw - 1;
-  let failed = false;
+  check(
+    await fails(() => buildIslands({ ...island, budget }), /over the/),
+    `a ${kb(budget)} budget fails the build`
+  );
+
+  console.log("\nstale registration");
+  check(
+    !!frappeUiEntries(resolvePackageDir("frappe-ui", bench.frontend)).length,
+    "the fixture resolves a frappe-ui to check against"
+  );
+  // Drop one published frappe-ui entry, which is what a registration written
+  // before frappe-ui grew that entry looks like. Linking against it would tell
+  // the island the entry is outside the closure and bundle it instead.
+  const registration = JSON.parse(fs.readFileSync(bench.assetsJson, "utf-8"));
+  await withRegistration(
+    Object.fromEntries(
+      Object.entries(registration).filter(
+        ([key]) => key !== "frappe-ui/list.runtime.js"
+      )
+    ),
+    async () =>
+      check(
+        await fails(
+          () => buildIslands(island),
+          /does not publish frappe-ui\/list/
+        ),
+        "a registration missing a frappe-ui entry fails the build"
+      )
+  );
+}
+
+/** Run `body` against a doctored assets.json, then put the real one back. */
+async function withRegistration(assets, body) {
+  const saved = fs.readFileSync(bench.assetsJson, "utf-8");
+  fs.writeFileSync(bench.assetsJson, JSON.stringify(assets, null, 4));
   try {
-    await buildIslands({ ...island, budget });
-  } catch (error) {
-    failed = /over the/.test(error.message);
+    await body();
+  } finally {
+    fs.writeFileSync(bench.assetsJson, saved);
   }
-  check(failed, `a ${kb(budget)} budget fails the build`);
+}
+
+/** Whether `body` throws a message matching `pattern`. */
+async function fails(body, pattern) {
+  try {
+    await body();
+  } catch (error) {
+    return pattern.test(error.message);
+  }
+  return false;
 }
 
 /* ------------------------------------------------------------------ staging */
