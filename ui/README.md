@@ -83,6 +83,43 @@ import { Link } from "@framework/ui";
 
 Subpaths work too (via the `./*` export), e.g. `import { FormLayout } from '@framework/ui/FormLayout'`.
 
+## Building desk islands — `@framework/ui/vite/island`
+
+An **island** is an app-provided Vue UI unit that desk mounts in a shadow root against
+framework's shared runtime. The preset is how an app builds one. It fixes everything the
+mount contract depends on, so an app declares only its entries:
+
+```js
+// apps/insights/frontend/build-islands.mjs
+import { buildIslands } from "@framework/ui/vite/island";
+
+await buildIslands({
+  app: "insights",
+  root: import.meta.dirname,
+  entries: { insights_dashboard: "src/islands/dashboard.js" },
+  production: process.argv.includes("--production"),
+  watch: process.argv.includes("--watch"),
+});
+```
+
+An entry becomes `<name>.island.js` and `<name>.island.css` in `assets.json` — the keys
+`frappe.ui.mount_island` resolves, deliberately distinct from the legacy `.bundle.js`
+ones. Output lands in `sites/assets/<app>/dist/island/<name>/`. Entry names share one
+namespace with every other app's, so prefix them with the app.
+
+What the preset does, and the options that change it:
+
+| | |
+| --- | --- |
+| **Externals** | The runtime closure stays bare (`vue`, `frappe-ui`, `frappe-ui/charts`, `echarts/core`, …), read from the runtime's own `assets.json` registration — see [ADR-0008](docs/adr/0008-island-externals-come-from-the-runtime-registration-not-a-second-walk.md). Build the runtime first (`bench build --app frappe`); a registration that does not publish every entry the installed frappe-ui exports **fails the build**, because linking against a stale one silently bundles what it fails to name. |
+| **CSS** | One extracted stylesheet per island: Tailwind scanning `content` (default `src/**/*.{vue,js,ts,jsx,tsx,html}`), no preflight and no base layer (the runtime sheet carries both), `:root`/`html`/`body` rewritten to `:host`, dark mode on `[data-theme="dark"]`. |
+| **Icons** | `~icons/lucide/<name>` works, through frappe-ui's resolver. |
+| **Budget** | `budget` bytes of JS + CSS per entry, default 256 kB; over it **fails the build**. Pin it to your own first clean build plus slack. `forbiddenImports` is an optional app-local escape hatch. |
+| **Watch** | `watch: true` rebuilds into the same place and re-registers. Firing frappe's `hot_update` is still to come — see the TODO in `vite/island/bench.js`. |
+
+`node ui/vite/island/tests/verify.mjs` builds a fixture island and checks the whole
+contract end to end.
+
 ## Adding to the package
 
 1. Create the component/utility under `src/`.
