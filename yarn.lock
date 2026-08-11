@@ -2413,10 +2413,10 @@ frappe-quill-image-resize@^3.0.9:
     quill "^1.2.2"
     raw-loader "^0.5.1"
 
-frappe-ui@^1.0.0-beta.42:
-  version "1.0.0-beta.42"
-  resolved "https://registry.yarnpkg.com/frappe-ui/-/frappe-ui-1.0.0-beta.42.tgz#2d3c31a45c05aa2b25de29e2050447a23929b1fc"
-  integrity sha512-DX9NJpj8FMe41sIpd3soxd7eYErutok4lfeE0ysT7+AfTnQEnt+WPhOTWhlaKkgQ7z2hsm0ENDGPP3cLs8SQuA==
+frappe-ui@^1.0.0-beta.45:
+  version "1.0.0-beta.45"
+  resolved "https://registry.yarnpkg.com/frappe-ui/-/frappe-ui-1.0.0-beta.45.tgz#f61389c42b125dbaf363ba4417cb87cbcc56b6b6"
+  integrity sha512-GaepTB0GrAW2tVYQP3KFOVGp1xxXDmQg1q7suFr30LcUraH2KEGdrRGEurETWGAQnde556Fi9Nf+Pb+I4c8qlQ==
   dependencies:
     "@codemirror/lang-css" "^6.3.0"
     "@codemirror/lang-html" "^6.4.9"
