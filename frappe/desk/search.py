@@ -149,10 +149,11 @@ def search_widget(
 
 	if query:  # Query = custom search query i.e. python function
 		meta = frappe.get_meta(doctype)
-		# For translated doctypes, pass empty txt and a large page_length so the custom query
-		# returns all records without SQL-level text filtering; Python-level filtering against
-		# translated values is applied below.
+		# For translated doctypes, pass empty txt, no offset and a large page_length so the custom
+		# query returns all records without SQL-level text filtering or paging; Python-level
+		# filtering against translated values and paging are applied below.
 		query_txt = "" if meta.translated_doctype else txt
+		query_start = 0 if meta.translated_doctype else start
 		query_page_length = PAGE_LENGTH_FOR_LINK_VALIDATION if meta.translated_doctype else page_length
 
 		if sbool(query_filters_as_dict) and isinstance(filters, list):
@@ -168,7 +169,7 @@ def search_widget(
 				doctype,
 				query_txt,
 				searchfield,
-				start,
+				query_start,
 				query_page_length,
 				filters,
 				as_dict=as_dict,
@@ -194,7 +195,7 @@ def search_widget(
 			if meta.translated_doctype:
 				values = filter_translated(values, txt, as_dict)
 				values = sorted(values, key=lambda x: relevance_sorter(x, txt, as_dict))
-				values = values[:page_length]
+				values = values[start : start + page_length]
 
 		return values
 
@@ -283,7 +284,8 @@ def search_widget(
 		filters=filters,
 		fields=formatted_fields,
 		or_filters=or_filters,
-		limit_start=start,
+		# translated doctypes are matched and paged in Python below, so the whole set is fetched
+		limit_start=0 if meta.translated_doctype else start,
 		limit_page_length=None if meta.translated_doctype else page_length,
 		order_by=order_by,
 		ignore_permissions=doctype == "DocType",
@@ -302,8 +304,10 @@ def search_widget(
 		# Then it will bring the rest of the elements and sort them in lexicographical order
 		values = sorted(values, key=lambda x: relevance_sorter(x, txt, as_dict))
 
-		# remove _relevance from results
-		if not meta.translated_doctype:
+		if meta.translated_doctype:
+			values = values[start : start + page_length]
+		else:
+			# remove _relevance from results
 			if as_dict:
 				for r in values:
 					r.pop("_relevance", None)
