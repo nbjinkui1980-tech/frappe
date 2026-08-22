@@ -628,6 +628,14 @@
 	.grid-form-body {
 		max-height: 80vh;
 		overflow: auto;
+
+		&:has(.awesomplete > [role="listbox"]:not([hidden])) {
+			overflow: visible;
+		}
+	}
+
+	&:has(.grid-form-body .awesomplete > [role="listbox"]:not([hidden])) {
+		overflow: visible;
 	}
 
 	// Tabs styling for child table grid row forms
