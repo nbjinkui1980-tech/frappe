@@ -44,7 +44,7 @@ class NumberCard(Document):
 		module: DF.Link | None
 		parent_document_type: DF.Link | None
 		report_field: DF.Literal[None]
-		report_function: DF.Literal["Sum", "Average", "Minimum", "Maximum"]
+		report_function: DF.Literal["Count", "Sum", "Average", "Minimum", "Maximum"]
 		report_name: DF.Link | None
 		show_full_number: DF.Check
 		show_percentage_stats: DF.Check
@@ -71,8 +71,12 @@ class NumberCard(Document):
 				frappe.throw(_("Parent Document Type is required to create a number card"))
 
 		elif self.type == "Report":
-			if not (self.report_name and self.report_field and self.function):
-				frappe.throw(_("Report Name, Report Field and Fucntion are required to create a number card"))
+			if not (self.report_name and self.function):
+				frappe.throw(_("Report Name and Function are required to create a number card"))
+			if self.function != "Count" and not self.report_field:
+				frappe.throw(
+					_("Report field is required to create a number card with function {}").format(self.function)
+				)
 
 		elif self.type == "Custom":
 			if not self.method:
