@@ -27,7 +27,7 @@ class Action(Enum):
 
 def get_gravatar_image_fields():
 	fields = list(BASE_GRAVATAR_IMAGE_FIELDS)
-	if "erpnext" in frappe.get_installed_apps():
+	if {"anydeals_erp", "erpnext"} & set(frappe.get_installed_apps()):
 		fields.extend(ERPNEXT_GRAVATAR_IMAGE_FIELDS)
 	return fields
 

@@ -33,19 +33,21 @@ class InstalledApplications(Document):
 
 		app_wise_setup_details = self.get_app_wise_setup_details()
 		disabled_apps = frappe.get_disabled_apps()
+		erp_app = "anydeals_erp" if "anydeals_erp" in frappe.get_installed_apps() else "erpnext"
+		wizard_apps = ("frappe", erp_app)
 
 		self.delete_key("installed_applications")
 		for app in frappe.utils.get_installed_apps_info():
 			has_setup_wizard = 1
 			setup_complete = app_wise_setup_details.get(app.get("app_name")) or 0
-			if app.get("app_name") in ["frappe", "erpnext"] and not setup_complete:
+			if app.get("app_name") in wizard_apps and not setup_complete:
 				if app.get("app_name") == "frappe" and has_non_admin_user():
 					setup_complete = 1
 
-				if app.get("app_name") == "erpnext" and has_company():
+				if app.get("app_name") == erp_app and has_company():
 					setup_complete = 1
 
-			if app.get("app_name") not in ["frappe", "erpnext"]:
+			if app.get("app_name") not in wizard_apps:
 				setup_complete = 0
 				has_setup_wizard = 0
 

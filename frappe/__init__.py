@@ -1459,7 +1459,8 @@ def is_setup_complete():
 	from frappe.apps import get_disabled_apps
 
 	disabled_apps = get_disabled_apps()
-	wizard_apps = [app for app in ["frappe", "erpnext"] if app not in disabled_apps]
+	erp_app = "anydeals_erp" if "anydeals_erp" in frappe.get_installed_apps() else "erpnext"
+	wizard_apps = [app for app in ["frappe", erp_app] if app not in disabled_apps]
 	if all(
 		frappe.get_all(
 			"Installed Application",
