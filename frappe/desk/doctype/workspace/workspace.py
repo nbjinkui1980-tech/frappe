@@ -2,18 +2,19 @@
 # License: MIT. See LICENSE
 
 from collections import Counter, defaultdict
-from json import loads
+from json import dumps, loads
 
 import frappe
 from frappe import _
-from frappe.boot import get_sidebar_items
 from frappe.desk.desk_views import DeskViews
 from frappe.desk.desktop import get_workspaces, save_new_widget
+from frappe.desk.doctype.desktop_settings.desktop_settings import is_desktop_icons_page
 from frappe.desk.utils import validate_route_conflict
 from frappe.model.document import Document
 from frappe.model.rename_doc import rename_doc
 from frappe.modules.export_file import delete_folder, export_to_files
 from frappe.utils import strip_html
+from frappe.utils.html_utils import sanitize_html
 
 
 class Workspace(Document, DeskViews):
@@ -32,10 +33,8 @@ class Workspace(Document, DeskViews):
 		from frappe.desk.doctype.workspace_number_card.workspace_number_card import WorkspaceNumberCard
 		from frappe.desk.doctype.workspace_quick_list.workspace_quick_list import WorkspaceQuickList
 		from frappe.desk.doctype.workspace_shortcut.workspace_shortcut import WorkspaceShortcut
-		from frappe.desk.doctype.workspace_sidebar_item.workspace_sidebar_item import WorkspaceSidebarItem
 		from frappe.types import DF
 
-		app: DF.Data | None
 		charts: DF.Table[WorkspaceChart]
 		content: DF.LongText | None
 		custom_blocks: DF.Table[WorkspaceCustomBlock]
@@ -72,16 +71,31 @@ class Workspace(Document, DeskViews):
 		roles: DF.Table[HasRole]
 		sequence_id: DF.Float
 		shortcuts: DF.Table[WorkspaceShortcut]
-		sidebar_items: DF.Table[WorkspaceSidebarItem]
 		standard: DF.Check
 		title: DF.Data
 		type: DF.Literal["Workspace", "Link", "URL"]
 	# end: auto-generated types
 
+	def before_validate(self):
+		# `before_validate` and not `validate`: a fixture import sets `ignore_validate`, which skips
+		# `validate` but not the sanitizer -- and the import is the very write that damaged every
+		# workspace shipping markup in its blocks.
+		self.content = sanitize_content(self.content)
+
 	def validate(self):
 		self.title = strip_html(self.title)
 
-		if self.public and not is_workspace_manager() and not disable_saving_as_public():
+		# `with_module` is a page a module brought with it rather than a person publishing one:
+		# a module the site adds creates the page it opens on (`ModuleDef.after_insert`), and
+		# what guards *that* is the right to create a module -- a higher bar than this one, and
+		# held by a different role. Asked again here, somebody could mint a module and then be
+		# told they may not give it anywhere to go, which is a module nobody can reach.
+		if (
+			self.public
+			and not self.flags.with_module
+			and not is_workspace_manager()
+			and not disable_saving_as_public()
+		):
 			frappe.throw(_("You need to be Workspace Manager to edit this document"))
 		if self.has_value_changed("title"):
 			validate_route_conflict(self.doctype, self.title)
@@ -96,7 +110,7 @@ class Workspace(Document, DeskViews):
 
 		# Keep standard (app-shipped) workspaces app-owned: their content is only changed by
 		# import (migrate/install) or by an app author in developer mode. Site edits go to a
-		# Workspace Customization delta instead, so they survive app updates.
+		# Custom Workspace delta instead, so they survive app updates.
 		if (
 			self.standard
 			and not self.is_new()
@@ -117,18 +131,6 @@ class Workspace(Document, DeskViews):
 				shortcut.report_ref_doctype = frappe.get_value("Report", shortcut.link_to, "ref_doctype")
 
 		self.validate_duplicate_widget_labels()
-
-		if self.standard:
-			if not self.app and self.module:
-				from frappe.modules.utils import get_module_app
-
-				self.app = get_module_app(self.module)
-
-		# `app` is the workspace's mount point -- it decides which app's dock lists it. A bad value
-		# doesn't error anywhere downstream, it just silently drops the workspace off every dock,
-		# so reject it here rather than let it strand the workspace.
-		if self.app and self.app not in frappe.get_installed_apps():
-			frappe.throw(_("{0} is not an installed app.").format(frappe.bold(self.app)))
 
 	@staticmethod
 	def get_widget_label_counts(doc, parentfield) -> Counter:
@@ -202,7 +204,11 @@ class Workspace(Document, DeskViews):
 			)
 
 	def clear_cache(self):
+		from frappe.desk.doctype.sidebar.sidebar import clear_computed_base_for
+
 		super().clear_cache()
+		# a module with no `Sidebar` has its sidebar computed from workspaces like this one
+		clear_computed_base_for(self)
 		if self.for_user:
 			frappe.cache.hdel("bootinfo", self.for_user)
 		else:
@@ -217,7 +223,14 @@ class Workspace(Document, DeskViews):
 
 			if self.has_value_changed("title") or self.has_value_changed("module"):
 				previous = self.get_doc_before_save()
-				if previous and previous.get("module") and previous.get("title"):
+				# ... and the module it used to be under may be gone, which `delete_folder`
+				# resolves to a path and throws on -- see `after_delete`
+				if (
+					previous
+					and previous.get("module")
+					and previous.get("title")
+					and frappe.db.exists("Module Def", previous.get("module"))
+				):
 					delete_folder(previous.get("module"), "Workspace", previous.get("title"))
 
 	def export_workspace(self):
@@ -232,23 +245,38 @@ class Workspace(Document, DeskViews):
 			self.name = doc.name = doc.label = doc.title
 
 	def on_trash(self):
-		if not self.module:
-			self.delete_sidebar()
-			self.delete_desktop_icon()
 		if self.public and not is_workspace_manager():
 			frappe.throw(_("You need to be Workspace Manager to delete a public workspace."))
 
-	def delete_desktop_icon(self):
-		frappe.delete_doc_if_exists("Desktop Icon", self.title)
+		self.delete_desktop_icon()
 
-	def delete_sidebar(self):
-		frappe.delete_doc_if_exists("Workspace Sidebar", self.title)
+	def delete_desktop_icon(self):
+		"""Take the workspace's icon off the grid with it.
+
+		Gated on the desktop page by construction rather than left to run in both modes: an
+		Apps-mode site holds no icon rows at all, so this used to be harmless only by
+		consequence -- the one place containment did not hold by design.
+
+		Matched on the workspace's name, which is what both writers label the icon with
+		(autoname is `field:label`). Matching on the title would let a private page take a
+		public one's icon down with it, since a private page's name carries an owner suffix
+		its title does not.
+		"""
+		if not is_desktop_icons_page():
+			return
+
+		frappe.delete_doc_if_exists("Desktop Icon", self.name)
 
 	def after_delete(self):
 		if disable_saving_as_public():
 			return
 
-		if self.module and frappe.conf.developer_mode:
+		# A page can outlive its module: `ModuleDef.on_trash` takes a module's navigation with it
+		# and leaves content alone, so `module` may name one that is no longer there. Asked
+		# first, because `delete_folder` resolves the module to a path and throws for a module
+		# that does not exist -- which made a page whose module had been deleted impossible to
+		# delete at all. There is no folder to remove for one either.
+		if self.module and frappe.conf.developer_mode and frappe.db.exists("Module Def", self.module):
 			delete_folder(self.module, "Workspace", self.title)
 
 	@staticmethod
@@ -273,24 +301,6 @@ class Workspace(Document, DeskViews):
 					ignore_permissions=True,
 				)
 			frappe.db.set_value("Workspace", new_label, {"for_user": new_name, "label": new_label})
-
-	@staticmethod
-	def get_module_wise_workspaces():
-		workspaces = frappe.get_all(
-			"Workspace",
-			fields=["name", "module"],
-			filters={"for_user": "", "public": 1},
-			order_by="creation",
-		)
-
-		module_workspaces = defaultdict(list)
-
-		for workspace in workspaces:
-			if not workspace.module:
-				continue
-			module_workspaces[workspace.module].append(workspace.name)
-
-		return module_workspaces
 
 	def get_link_groups(self):
 		cards = []
@@ -382,20 +392,153 @@ def disable_saving_as_public():
 	)
 
 
+def module_page(module: str) -> frappe._dict | None:
+	"""The page named after `module`, whoever it belongs to, or `None` if the name is free.
+
+	One read, asked by both ends of the same rule: `make_module_workspace` decides whether it
+	may adopt the page, and whoever is about to create a module decides whether the name can be
+	had at all.
+	"""
+	return frappe.db.get_value("Workspace", module, ["name", "module"], as_dict=True)
+
+
+def module_name_is_free(module: str) -> bool:
+	"""Whether a module of this name may be created: nothing else on the site holds the name.
+
+	A page that already names this module does not count as holding it -- that is the module's
+	own page, waiting for the module to exist again.
+	"""
+	if frappe.db.exists("Module Def", module):
+		return False
+
+	page = module_page(module)
+	return page is None or page.module == module
+
+
+def sanitize_content(content: str | None) -> str | None:
+	"""The form a workspace's blocks are stored in: markup sanitized, no angle bracket left over.
+
+	`content` is a Long Text field holding a JSON document, and every write of a Long Text field
+	goes through the XSS sanitizer (`BaseDocument._sanitize_content`). That sanitizer reads the
+	*whole field* as HTML, so the markup a header block carries -- `<span class=\\"h4\\">`, quotes
+	escaped because it lives inside a JSON string -- comes back as `class="\\&quot;h4\\&quot;"` and
+	the field has stopped being JSON. Every reader of it raises from then on, and the reader of
+	`Home` is the desk itself.
+
+	So the field reaches the sanitizer with nothing in it for the sanitizer to do:
+
+	* Each string in the document is sanitized *as HTML* on its own, which is where the check
+	  belongs and where it works -- a `<script>` in a paragraph is dropped, a `<b>` is kept.
+	* The serialized document is then written with every `<` and `>` as its `\\u003c` / `\\u003e`
+	  JSON escape. `loads` and `JSON.parse` hand back the same markup either way, but the stored
+	  string carries nothing the sanitizer recognises as a tag, so it skips the field on its
+	  `"<" not in value` check and the JSON survives the trip.
+
+	Content that doesn't parse is handed back untouched: re-serializing what nobody can read is
+	not on offer. A row damaged before this existed comes back when its app file is imported over
+	it, which is why an app ships its workspaces in exactly the form this returns -- the file is
+	the repair.
+	"""
+	if not content:
+		return content
+
+	try:
+		document = loads(content)
+	except ValueError:
+		return content
+
+	# `<` and `>` only ever occur inside a string literal here -- JSON's own syntax has no angle
+	# bracket -- so escaping them in the serialized form cannot touch the structure.
+	return dumps(sanitize_strings(document)).replace("<", "\\u003c").replace(">", "\\u003e")
+
+
+def sanitize_strings(value):
+	"""Run the HTML sanitizer over every string in a parsed block document, at any depth."""
+	if isinstance(value, str):
+		return sanitize_html(value)
+	if isinstance(value, list):
+		return [sanitize_strings(v) for v in value]
+	if isinstance(value, dict):
+		return {key: sanitize_strings(v) for key, v in value.items()}
+	return value
+
+
+def welcome_blocks(title: str) -> list[dict]:
+	"""What a page nobody has written yet opens on.
+
+	The same two blocks the desk seeds a page somebody creates by hand with (`initialize_new_page`
+	in workspace.js), so a page reads the same whichever end made it. Plain text in both, which is
+	all a page nobody has written yet has to say -- markup would be kept (see `sanitize_content`),
+	it just has nothing to add here.
+	"""
+	return [
+		{"type": "header", "data": {"text": _("Welcome to the {0} workspace").format(title)}},
+		{"type": "paragraph", "data": {"text": _("Click on the {0} menu to edit").format("\u22ef")}},
+	]
+
+
+def make_module_workspace(module: str, icon: str | None = None) -> str | None:
+	"""The page a module opens on, made with the module.
+
+	Public, and named after the module, because it is the module's own: `pick_primary` gives a
+	module the workspace that shares its name, and a computed sidebar is built from what the
+	module holds -- so this one page is the module's whole sidebar until somebody puts more in it.
+
+	`icon` is the module's icon as much as the page's: a computed sidebar has nowhere to state a
+	header icon, so it reads the one off this page (`own_page_icon`), and that is what the dock
+	draws the module with.
+
+	A page of this name that already claims the module is *this module's own*, left behind when
+	the module was deleted -- `ModuleDef.on_trash` takes a module's navigation with it and leaves
+	content alone. Making the module again adopts it back, rather than refusing a name the site
+	is not really using and stranding a page nothing can reach.
+
+	Any other page of that name belongs to somebody else and is left exactly where it is; the
+	answer is `None`, and the module comes out with no page rather than with one it took.
+	"""
+	if existing := module_page(module):
+		if existing.module != module:
+			return None
+		# the icon is the module's, and this is the module being made again
+		if icon:
+			frappe.db.set_value("Workspace", existing.name, "icon", icon)
+		return existing.name
+
+	page = frappe.get_doc(
+		{
+			"doctype": "Workspace",
+			"label": module,
+			"title": module,
+			"module": module,
+			"public": 1,
+			"icon": icon or None,
+			"content": dumps(welcome_blocks(module)),
+		}
+	)
+	# made by the module rather than by whoever happened to create it -- see `validate`
+	page.flags.with_module = True
+	page.insert(ignore_permissions=True)
+
+	return page.name
+
+
 def workspace_payload(**extra):
 	"""The desk state a workspace write invalidates, for the caller to swap into `frappe.boot`.
 
-	`app_data` is in here because the dock is app-scoped: it lists `app_data[app].workspaces`, so
-	a workspace that just gained or changed its `app` only moves once that mapping is rebuilt.
+	`app_data` is in here because the dock is app-scoped: it renders `app_data[app].dock`, so a
+	workspace that just gained or changed its module only moves once that mapping is rebuilt.
 	Without it the desk needs a full reload to show the change.
 	"""
-	from frappe.boot import get_app_data
+	from frappe.boot import build_entity_module_map, get_app_data, get_module_sidebars
 
 	workspaces = get_workspaces()
+	module_sidebars = get_module_sidebars()
 	return {
 		"workspace_pages": workspaces,
-		"sidebar_items": get_sidebar_items(),
-		"app_data": get_app_data([d.name for d in workspaces.get("pages")]),
+		"app_data": get_app_data(),
+		# the module-keyed payload, so a hot-swapping caller updates both keyspaces at once
+		"module_sidebars": module_sidebars,
+		"entity_module": build_entity_module_map(module_sidebars),
 		**extra,
 	}
 
@@ -434,8 +577,15 @@ def new_page(new_page: dict):
 	if not page:
 		return
 
+	# Sharing a page -- with everyone, or with a group of roles -- is the Workspace Manager's
+	# to do; everyone else creates private pages, which is the only level the dialog offers
+	# them. Said out loud rather than returning quietly: a caller that asks for a public page
+	# and is handed `null` cannot tell the refusal apart from a failure.
 	if page.get("public") and not is_workspace_manager():
-		return
+		frappe.throw(
+			_("You need the Workspace Manager role to create a workspace others can see."),
+			frappe.PermissionError,
+		)
 	elif (
 		not page.get("public") and page.get("for_user") != frappe.session.user and not is_workspace_manager()
 	):
@@ -458,7 +608,10 @@ def new_page(new_page: dict):
 	for role in page.get("roles") or []:
 		if role.get("role"):
 			doc.append("roles", {"role": role.get("role")})
-	doc.app = page.get("app")
+	# Every workspace belongs to a module now. The client sends the module whose shell it was
+	# created from (`current_module`); fall back to the mounted app's first module so a caller
+	# that predates this still works.
+	doc.module = page.get("module") or first_module_of_app(page.get("app"))
 	doc.type = page.get("type")
 	doc.link_to = page.get("link_to")
 	doc.link_type = page.get("link_type")
@@ -466,24 +619,91 @@ def new_page(new_page: dict):
 	doc.sequence_id = last_sequence_id(doc) + 1
 	doc.save(ignore_permissions=True)
 
-	# Seed a new workspace's sidebar with a link to itself, so landing on its shell shows the
-	# workspace in its own sidebar instead of an empty "No Sidebar Items" state. This is done
-	# after the initial save: the self-link's `link_to` is validated against the Workspace
-	# doctype, so the workspace row must already exist.
-	if doc.type == "Workspace":
-		doc.append(
-			"sidebar_items",
-			{
-				"type": "Link",
-				"label": doc.title,
-				"link_type": "Workspace",
-				"link_to": doc.name,
-				"icon": doc.icon,
-			},
-		)
-		doc.save(ignore_permissions=True)
+	# A workspace no longer owns a sidebar -- its module does. So instead of seeding a
+	# self-referencing item on the workspace, add a link to it in the module's sidebar, which
+	# is where it will actually be navigated from. A private one is derived rather than
+	# written; `add_to_sidebar` is where that branch lives.
+	add_to_sidebar(doc)
 
 	return workspace_payload()
+
+
+def get_workspace_app(doc) -> str | None:
+	"""The app a workspace belongs to -- its module's app.
+
+	There is no `Workspace.app` any more. It was a second, hand-set answer to a question the
+	module already answers, and the two could disagree.
+	"""
+	if not doc.module:
+		return None
+	return frappe.db.get_value("Module Def", doc.module, "app_name")
+
+
+def first_module_of_app(app: str | None) -> str | None:
+	if not app:
+		return None
+	modules = frappe.get_module_list(app)
+	return modules[0] if modules else None
+
+
+def add_to_sidebar(workspace):
+	"""Give a **shared** workspace a way in, from its module's sidebar.
+
+	A link is the whole of it. A workspace used to also be able to *become* the module's home
+	page on insert, which was a second, silent way of being reachable; now the module opens on
+	the first item of its sidebar, so appearing in that list is the only way in there is, and
+	the last one added is correctly not it.
+
+	The link goes in the site's customization layer, never in the sidebar document. The
+	document is app content -- on a non-developer-mode site nothing may write to it at all --
+	and a workspace somebody created here is site intent. Writing it into the base is what
+	would make the base unsafe for an app to overwrite on update.
+
+	**A private workspace gets nothing written for it.** This is the branch D3 asks for: the
+	shared branch writes a link, the private branch writes none, because a private page's link
+	is derived on read from the workspace itself -- module, owner, title and icon are all
+	already on it (`sidebar.get_private_workspaces`). Writing one put a row per private page
+	into the document the whole site shares, and every one of those rows was a second copy of
+	four columns that could change underneath it.
+
+	Called on every write that can leave a workspace shared, not only on insert, since a page
+	that has just been made public needs the link its private form did not store.
+
+	Only reaches modules that *have* a document, which is now the minority: for the rest the
+	base is computed, and a public workspace turns up in it on its own because
+	`get_module_info` reads them.
+	"""
+	from frappe.desk.doctype.custom_sidebar.custom_sidebar import (
+		add_site_sidebar_item,
+	)
+
+	# A Link or a URL workspace is a shortcut to somewhere else, and the sidebar already lists
+	# that somewhere else; only a page of its own earns a way in. `type` is empty on pages that
+	# predate the field, and those are ordinary workspaces -- the same reading
+	# `sidebar.get_private_workspaces` gives them.
+	if not workspace.public or (workspace.type and workspace.type != "Workspace"):
+		return
+
+	# The naming rule: the sidebar a module answers with is the one called after it. A module
+	# whose only sidebar is called something else is a module with no sidebar of its own, and
+	# its base is computed -- where a public workspace turns up by itself.
+	if not workspace.module or not frappe.db.exists("Sidebar", workspace.module):
+		return
+
+	sidebar = frappe.get_cached_doc("Sidebar", workspace.module)
+	if any(item.link_type == "Workspace" and item.link_to == workspace.name for item in sidebar.items):
+		return
+
+	add_site_sidebar_item(
+		workspace.module,
+		{
+			"type": "Link",
+			"label": workspace.title,
+			"link_type": "Workspace",
+			"link_to": workspace.name,
+			"icon": workspace.icon,
+		},
+	)
 
 
 @frappe.whitelist()
@@ -502,7 +722,7 @@ def save_page(name: str, public: str | int, new_widgets: dict, blocks: str):
 	# layout changes are stored as a delta on top of the live base, so app updates keep
 	# flowing. In developer mode the app author edits the base itself so it exports to JSON.
 	if doc.standard and not frappe.conf.developer_mode:
-		from frappe.desk.doctype.workspace_customization.workspace_customization import (
+		from frappe.desk.doctype.custom_workspace.custom_workspace import (
 			upsert_content_customization,
 		)
 
@@ -536,7 +756,7 @@ def update_page(name: str, title: str, icon: str, indicator_color: str, parent: 
 	# overrides (icon / colour) are captured as a delta. In developer mode the app author
 	# edits the base itself so it exports to JSON.
 	if doc.standard and not frappe.conf.developer_mode:
-		from frappe.desk.doctype.workspace_customization.workspace_customization import (
+		from frappe.desk.doctype.custom_workspace.custom_workspace import (
 			upsert_property_customization,
 		)
 
@@ -575,6 +795,11 @@ def update_page(name: str, title: str, icon: str, indicator_color: str, parent: 
 				if child.name != new_child_name:
 					rename_doc("Workspace", child.name, new_child_name, force=True, ignore_permissions=True)
 
+		# A page that has just stopped being private has stopped having a derived link too, so
+		# this is where it earns a stored one. Reloaded because the rename above renamed the
+		# thing the link has to name.
+		add_to_sidebar(frappe.get_doc("Workspace", new_name))
+
 	return {"name": title, "public": public, "label": new_name}
 
 
@@ -586,9 +811,9 @@ def get_manageable_workspaces():
 	manager for a Workspace Manager (who should see every workspace, including other users'
 	private ones). Everyone else sees only their own private workspaces.
 	"""
-	# `app` comes along so the dialog can group the workspaces that aren't mounted to any app
-	# (and so appear on no dock) into their own list.
-	fields = ["name", "title", "icon", "public", "for_user", "standard", "app"]
+	# `app` comes along so the dialog can group the workspaces whose module belongs to no app
+	# (and which therefore appear on no rail) into their own list.
+	fields = ["name", "title", "icon", "public", "for_user", "standard", "module"]
 	if is_workspace_manager():
 		filters = {}
 	else:
@@ -609,7 +834,7 @@ def get_workspace_settings(name: str):
 	Resolves the site's customization delta for a standard (app-shipped) workspace so the
 	dialog shows a single truth (base + overrides), matching what the desk renders.
 	"""
-	from frappe.desk.doctype.workspace_customization.workspace_customization import (
+	from frappe.desk.doctype.custom_workspace.custom_workspace import (
 		effective_roles,
 		get_customization,
 	)
@@ -651,7 +876,8 @@ def get_workspace_settings(name: str):
 		"standard": is_standard,
 		"access": access,
 		"roles": sorted(roles),
-		"app": doc.app,
+		"module": doc.module,
+		"app": get_workspace_app(doc),
 	}
 
 
@@ -663,12 +889,12 @@ def update_workspace_settings(
 	indicator_color: str | None = None,
 	access: str | None = None,
 	roles: list | str | None = None,
-	app: str | None = None,
+	module: str | None = None,
 ):
-	"""Save appearance + access/roles + app mount for a workspace from the Manage Workspaces dialog.
+	"""Save appearance + access/roles + module for a workspace from the Manage Workspaces dialog.
 
-	A standard (app-shipped) workspace keeps its app-owned title / route / visibility / app; only
-	its appearance and role gating are captured as a Workspace Customization delta. A custom
+	A standard (app-shipped) workspace keeps its app-owned title / route / visibility / module; only
+	its appearance and role gating are captured as a Custom Workspace delta. A custom
 	(or developer-mode) workspace is edited in place, with `access` mapped onto the underlying
 	`public` / `for_user` / `roles` fields (mirroring `new_page`).
 	"""
@@ -690,7 +916,7 @@ def update_workspace_settings(
 
 	is_standard = bool(doc.standard) and not frappe.conf.developer_mode
 	if is_standard:
-		from frappe.desk.doctype.workspace_customization.workspace_customization import (
+		from frappe.desk.doctype.custom_workspace.custom_workspace import (
 			upsert_settings_customization,
 		)
 
@@ -713,10 +939,9 @@ def update_workspace_settings(
 		doc.icon = icon
 	if indicator_color is not None:
 		doc.indicator_color = indicator_color
-	# the dock the workspace is mounted to. "" is a meaningful value (unmount it), so this is
-	# deliberately a `not None` check rather than a truthiness one.
-	if app is not None:
-		doc.app = app
+	if module:
+		validate_assignable_module(module)
+		doc.module = module
 	doc.set("roles", [{"role": r} for r in role_names])
 	if doc.public != make_public:
 		doc.sequence_id = frappe.db.count("Workspace", {"public": make_public}, cache=True)
@@ -742,6 +967,10 @@ def update_workspace_settings(
 		if child.name != new_child_name:
 			rename_doc("Workspace", child.name, new_child_name, force=True, ignore_permissions=True)
 
+	# Same as `update_page`: a workspace this save has made shared needs the link its private
+	# form derived rather than stored.
+	add_to_sidebar(frappe.get_doc("Workspace", new_name))
+
 	return workspace_payload(name=new_name)
 
 
@@ -765,64 +994,73 @@ def delete_page(name: str):
 
 
 @frappe.whitelist()
-def get_mountable_apps():
-	"""Apps a workspace may be mounted to, as `[{app_name, app_title}]`.
+def get_assignable_modules():
+	"""Modules a workspace can be assigned to, as `{module, label, app_name, app_title}`.
 
-	The installed apps that declare `add_to_apps_screen` and that the user is allowed into --
-	the same permission gate `load_desktop_data` applies when building `boot.app_data`. Apps
-	that declare no hook have no desk presence to mount into, so they're skipped.
-
-	Companion apps (those pinned into a host app's dock via `add_to_workspace_dock`) stay in the
-	list: mounting to one is meaningful, and the desk resolves it to the host's rail at read
-	time via `rail_host_app`.
+	Replaces `get_mountable_apps`: a workspace's rail placement follows its module now, so the
+	question is which module owns it, not which app it was placed in.
 	"""
-	apps = []
-	for app_name in frappe.get_installed_apps():
-		hooks = frappe.get_hooks("add_to_apps_screen", app_name=app_name)
-		if not hooks:
-			continue
+	from frappe.utils.modules import is_module_visible
 
-		app_info = hooks[0]
-		has_permission = app_info.get("has_permission")
-		if has_permission and not frappe.get_attr(has_permission)():
+	modules = []
+	for row in frappe.get_all("Module Def", fields=["name", "app_name"], order_by="app_name asc, name asc"):
+		if not is_module_visible(row.name):
 			continue
-
-		apps.append(
+		# An unplaced module is in no app's dock and has no app to be titled after. Asking
+		# `get_hooks` without an app name does not answer "no app" -- it returns the hook merged
+		# across every installed one, so every module the site owns came back titled after
+		# whichever app happened to be first.
+		app_title = (
+			(frappe.get_hooks("app_title", app_name=row.app_name) or [row.app_name])[0]
+			if row.app_name
+			else None
+		)
+		modules.append(
 			{
-				"app_name": app_info.get("name") or app_name,
-				"app_title": app_info.get("title")
-				or (frappe.get_hooks("app_title", app_name=app_name) or [None])[0]
-				or app_name,
+				"module": row.name,
+				"label": row.name,
+				"app_name": row.app_name,
+				"app_title": app_title,
 			}
 		)
+	return modules
 
-	return apps
+
+def validate_assignable_module(module: str) -> None:
+	"""Refuse a module a workspace may not be filed under.
+
+	Both endpoints that set `Workspace.module` have to make this check, and only one of them
+	did. `update_workspace_settings` took a `module` and wrote it straight through, so the same
+	operation was validated or not depending on which door it came in by.
+
+	A module that does not exist is already refused -- `Workspace.module` is a Link. What this
+	adds is the module the caller cannot *see*: a workspace filed under one is a workspace
+	nothing can navigate to, because `get_navigable_modules` drops the module before its
+	sidebar is ever built.
+	"""
+	if module not in {row["module"] for row in get_assignable_modules()}:
+		frappe.throw(_("{0} is not a module you can assign a workspace to.").format(frappe.bold(module)))
 
 
 @frappe.whitelist()
-def mount_workspace(name: str, app: str):
-	"""Mount a workspace onto an app's dock, from the in-page "not on any dock" prompt.
-
-	Narrow counterpart to `update_workspace_settings` -- it only sets `app`, so the prompt
-	doesn't have to round-trip the workspace's title / icon / access just to place it.
-	"""
+def set_workspace_module(name: str, module: str):
+	"""Move a workspace to another module, which is also what moves it between docks."""
 	doc = frappe.get_doc("Workspace", name)
 
 	if doc.standard and not frappe.conf.developer_mode:
-		# a standard workspace's app is owned by its module, and Workspace Customization has no
-		# field to record a per-site override in
-		frappe.throw(_("A standard workspace is mounted by the app that ships it."))
+		# a standard workspace's module is owned by the app that ships it, and Workspace
+		# Customization has no field to record a per-site override in
+		frappe.throw(_("A standard workspace belongs to the module that ships it."))
 
 	if not can_edit_workspace(doc):
 		frappe.throw(
-			_("You need the Workspace Manager role to mount this workspace."),
+			_("You need the Workspace Manager role to move this workspace."),
 			frappe.PermissionError,
 		)
 
-	if app not in [a["app_name"] for a in get_mountable_apps()]:
-		frappe.throw(_("{0} is not an app you can mount a workspace to.").format(frappe.bold(app)))
+	validate_assignable_module(module)
 
-	doc.app = app
+	doc.module = module
 	doc.save(ignore_permissions=True)
 
 	return workspace_payload(name=doc.name)
@@ -846,5 +1084,20 @@ def get_page_list(fields, filters):
 	return frappe.get_all("Workspace", fields=fields, filters=filters, order_by="sequence_id asc")
 
 
-def is_workspace_manager():
-	return "Workspace Manager" in frappe.get_roles()
+def is_workspace_manager(user: str | None = None) -> bool:
+	"""Whether `user` may curate navigation for everyone.
+
+	The one definition. The sidebar's layers and the dock's both gate on this, and both used to
+	carry a copy of it -- two functions of the same name and the same body, in three files, which
+	is three places to change the day the rule changes.
+
+	`Workspace Manager`, not System Manager: the two roles do not imply each other, and the
+	holder of the role literally named for curating navigation is the one who should be doing it.
+	"""
+	return "Workspace Manager" in frappe.get_roles(user)
+
+
+def check_workspace_manager(message: str) -> None:
+	"""Refuse anyone who is not one, with a message saying what they were trying to do."""
+	if not is_workspace_manager():
+		frappe.throw(message, frappe.PermissionError)

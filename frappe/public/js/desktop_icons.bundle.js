@@ -27,11 +27,18 @@ $.extend(frappe.desktop_utils, {
 		}
 	},
 });
+// The workspaces on an app's rail, read out of the one list `app_data` carries. A stated
+// behaviour change: that list holds the workspaces the app's `Dock` record names -- its own and
+// the ones companions mount onto it -- rather than every workspace whose module belongs to the
+// app. The icon grid is a retired surface an Apps-mode site never renders.
 function get_workspaces_from_app_name(app_name) {
 	const app = frappe.boot.app_data.filter((a) => {
 		return a.app_title === app_name;
 	});
-	if (app.length > 0) return app[0].workspaces;
+	if (app.length > 0)
+		return (app[0].dock || [])
+			.filter((row) => row.link_type === "Workspace")
+			.map((row) => row.link_to);
 }
 
 function get_route(desktop_icon) {
@@ -44,7 +51,7 @@ function get_route(desktop_icon) {
 			route = desktop_icon.link;
 		}
 	} else {
-		let sidebar = frappe.boot.workspace_sidebar_item[desktop_icon.label.toLowerCase()];
+		let sidebar = frappe.utils.sidebar_for_module(desktop_icon.module || desktop_icon.label);
 		if (desktop_icon.link_type == "Workspace Sidebar" && sidebar) {
 			let first_link = sidebar.items.find((i) => i.type == "Link");
 			if (first_link) {
@@ -936,11 +943,6 @@ class DesktopIcon {
 		});
 	}
 	validate_icon() {
-		// validate if my workspaces are empty
-		if (this.icon_data.label == "My Workspaces") {
-			if (frappe.boot.workspace_sidebar_item["my workspaces"].items.length == 0)
-				return false;
-		}
 		if (this.icon_type == "Folder") {
 			if (this.icon_data.child_icons.length == 0) return false;
 		}
