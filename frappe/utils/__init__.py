@@ -1399,10 +1399,12 @@ def _get_provider_descriptors() -> tuple[AppProviderDescriptor, ...]:
 	)
 
 
-def _get_provider_aliases() -> tuple[set[str], dict[str, str]]:
+def _get_provider_aliases(
+	descriptors: tuple[AppProviderDescriptor, ...] | None = None,
+) -> tuple[set[str], dict[str, str]]:
 	apps = set(frappe.get_all_apps())
 	aliases: dict[str, str] = {}
-	for descriptor in _get_provider_descriptors():
+	for descriptor in descriptors if descriptors is not None else _get_provider_descriptors():
 		for alias in descriptor.legacy_aliases:
 			if alias.name in apps:
 				raise _provider_contract_error(
@@ -1490,7 +1492,9 @@ def _read_site_apps() -> tuple[set[str], set[str]]:
 def get_capability_provider(kind: str) -> CapabilityProvider | None:
 	kind = _validate_provider_kind(kind)
 	bindings = _read_provider_bindings(kind)
-	candidates = tuple(descriptor for descriptor in _get_provider_descriptors() if descriptor.kind == kind)
+	descriptors = _get_provider_descriptors()
+	_get_provider_aliases(descriptors)
+	candidates = tuple(descriptor for descriptor in descriptors if descriptor.kind == kind)
 	if not candidates:
 		if kind in bindings:
 			raise ProviderBindingError(kind, ProviderBindingReason.NO_DESCRIPTOR_FOR_BOUND_KIND)

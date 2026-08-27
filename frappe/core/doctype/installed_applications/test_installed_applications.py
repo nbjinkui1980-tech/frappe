@@ -115,11 +115,14 @@ class TestProviderContract(UnitTestCase):
 
 	@staticmethod
 	def descriptor(
-		canonical_app: str = "virtual_erp", aliases: tuple[str, ...] = ("legacy_erp",)
+		canonical_app: str = "virtual_erp",
+		aliases: tuple[str, ...] = ("legacy_erp",),
+		*,
+		kind: str = "erp",
 	) -> AppProviderDescriptor:
 		return AppProviderDescriptor(
 			schema_version=1,
-			kind="erp",
+			kind=kind,
 			canonical_app=canonical_app,
 			legacy_aliases=tuple(LegacyAppAlias(name=name, remove_in="v19") for name in aliases),
 		)
@@ -192,7 +195,13 @@ class TestProviderContract(UnitTestCase):
 		with self.assertRaises(FrozenInstanceError):
 			descriptor.kind = "other"
 
-	def test_raw_loader_rejects_unknown_schema_and_fields(self):
+	def test_raw_loader_rejects_missing_target_unknown_schema_and_fields(self):
+		with (
+			patch.object(frappe, "get_all_apps", return_value=["frappe"]),
+			self.assertRaises(ProviderContractError),
+		):
+			load_app_provider_descriptor("virtual_erp")
+
 		for raw in (
 			self.raw_descriptor(schema_version=2),
 			{**self.raw_descriptor(), "setup_complete": True},
@@ -325,6 +334,37 @@ class TestProviderContract(UnitTestCase):
 		with patches[0], patches[1], patches[2], patches[3], self.assertRaises(ProviderContractError):
 			get_capability_provider("erp")
 
+	def test_provider_discovery_rejects_alias_conflicts_before_returning_provider(self):
+		states = (
+			(["legacy_erp", "virtual_erp"], (self.descriptor(),)),
+			(
+				[],
+				(
+					self.descriptor(aliases=("shared_alias",)),
+					self.descriptor("other_provider", ("shared_alias",), kind="other"),
+				),
+			),
+			(
+				[],
+				(
+					self.descriptor(aliases=("other_provider",)),
+					self.descriptor("other_provider", ("virtual_erp",), kind="other"),
+				),
+			),
+		)
+		for apps, descriptors in states:
+			patches = self.provider_patches(descriptors=descriptors)
+			with (
+				self.subTest(apps=apps, descriptors=descriptors),
+				patch.object(frappe, "get_all_apps", return_value=apps),
+				patches[0],
+				patches[1],
+				patches[2],
+				patches[3],
+				self.assertRaises(ProviderContractError),
+			):
+				get_capability_provider("erp")
+
 	def test_binding_state_is_never_cached(self):
 		descriptor = self.descriptor()
 		state = {"binding": {}, "complete": 0}
@@ -373,6 +413,11 @@ class TestProviderContract(UnitTestCase):
 				frappe.local.site = "site-one"
 				load_app_provider_descriptor("virtual_erp")
 				self.assertEqual(import_module.call_count, 2)
+				self.assertEqual(resolve_app_name("legacy_erp"), "virtual_erp")
+				self.assertEqual(
+					resolve_dotted_path("legacy_erp.module.method", surface="method"),
+					"virtual_erp.module.method",
+				)
 
 				modules["site-one"] = self.virtual_hooks(self.raw_descriptor(legacy_aliases=[]))
 				with (
@@ -385,6 +430,11 @@ class TestProviderContract(UnitTestCase):
 				):
 					clear_provider_caches()
 				self.assertEqual(len(load_app_provider_descriptor("virtual_erp").legacy_aliases), 0)
+				self.assertEqual(resolve_app_name("legacy_erp"), "legacy_erp")
+				self.assertEqual(
+					resolve_dotted_path("legacy_erp.module.method", surface="method"),
+					"legacy_erp.module.method",
+				)
 		finally:
 			frappe.local.site = original_site
 
