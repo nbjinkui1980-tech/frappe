@@ -90,6 +90,10 @@ _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
 	"get_file_json": ("frappe.utils", "get_file_json"),
 	"get_file_items": ("frappe.utils", "get_file_items"),
 	"get_attr": ("frappe.utils", "get_attr"),
+	"get_capability_provider": ("frappe.utils", "get_capability_provider"),
+	"load_app_provider_descriptor": ("frappe.utils", "load_app_provider_descriptor"),
+	"resolve_app_name": ("frappe.utils", "resolve_app_name"),
+	"resolve_dotted_path": ("frappe.utils", "resolve_dotted_path"),
 	# frappe.utils.background_jobs
 	"enqueue": ("frappe.utils.background_jobs", "enqueue"),
 	"enqueue_doc": ("frappe.utils.background_jobs", "enqueue_doc"),
@@ -192,13 +196,17 @@ if TYPE_CHECKING:  # pragma: no cover
 	from frappe.utils import (
 		create_folder,
 		get_attr,
+		get_capability_provider,
 		get_file_items,
 		get_file_json,
 		get_module,
 		get_traceback,
+		load_app_provider_descriptor,
 		mock,
 		parse_json,
 		read_file,
+		resolve_app_name,
+		resolve_dotted_path,
 		safe_eval,
 	)
 	from frappe.utils.background_jobs import enqueue, enqueue_doc
@@ -1459,12 +1467,13 @@ def is_setup_complete():
 	from frappe.apps import get_disabled_apps
 
 	disabled_apps = get_disabled_apps()
-	erp_app = "anydeals_erp" if "anydeals_erp" in frappe.get_installed_apps() else "erpnext"
-	wizard_apps = [app for app in ["frappe", erp_app] if app not in disabled_apps]
+	filters = {"has_setup_wizard": 1}
+	if disabled_apps:
+		filters["app_name"] = ("not in", disabled_apps)
 	if all(
 		frappe.get_all(
 			"Installed Application",
-			{"app_name": ("in", wizard_apps)},
+			filters,
 			pluck="is_setup_complete",
 		)
 	):

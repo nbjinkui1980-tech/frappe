@@ -33,23 +33,22 @@ class InstalledApplications(Document):
 
 		app_wise_setup_details = self.get_app_wise_setup_details()
 		disabled_apps = frappe.get_disabled_apps()
-		erp_app = "anydeals_erp" if "anydeals_erp" in frappe.get_installed_apps() else "erpnext"
-		wizard_apps = ("frappe", erp_app)
 
 		self.delete_key("installed_applications")
 		for app in frappe.utils.get_installed_apps_info():
-			has_setup_wizard = 1
+			app_name = app.get("app_name")
+			hooks = frappe.get_hooks(app_name=app_name)
+			has_setup_wizard = int(
+				app_name == "frappe"
+				or bool(hooks.get("setup_wizard_stages") or hooks.get("setup_wizard_complete"))
+			)
 			setup_complete = app_wise_setup_details.get(app.get("app_name")) or 0
-			if app.get("app_name") in wizard_apps and not setup_complete:
-				if app.get("app_name") == "frappe" and has_non_admin_user():
+			if has_setup_wizard and not setup_complete:
+				if app_name == "frappe" and has_non_admin_user():
 					setup_complete = 1
 
-				if app.get("app_name") == erp_app and has_company():
-					setup_complete = 1
-
-			if app.get("app_name") not in wizard_apps:
+			if not has_setup_wizard:
 				setup_complete = 0
-				has_setup_wizard = 0
 
 			self.append(
 				"installed_applications",
@@ -99,13 +98,6 @@ def has_non_admin_user():
 	if frappe.db.has_table("User") and frappe.db.get_value(
 		"User", {"user_type": "System User", "name": ["not in", ["Administrator", "Guest"]]}
 	):
-		return True
-
-	return False
-
-
-def has_company():
-	if frappe.db.has_table("Company") and frappe.get_all("Company", limit=1):
 		return True
 
 	return False

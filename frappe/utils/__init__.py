@@ -19,13 +19,16 @@ from collections.abc import (
 	MutableSequence,
 	Sequence,
 )
+from dataclasses import dataclass
 from email.header import decode_header, make_header
 from email.utils import formataddr, getaddresses, parseaddr
-from typing import Any, Generic, TypeAlias, TypedDict
+from enum import StrEnum
+from typing import Any, Generic, Literal, TypeAlias, TypedDict
 
 import orjson
 from werkzeug.test import Client
 
+import frappe
 from frappe.deprecation_dumpster import (
 	get_gravatar,
 	get_gravatar_url,
@@ -34,6 +37,8 @@ from frappe.deprecation_dumpster import (
 	has_gravatar,
 	make_esc,
 )
+from frappe.exceptions import ValidationError
+from frappe.utils.caching import site_cache
 
 # utility functions like cint, int, flt, etc.
 from frappe.utils.data import *
@@ -56,6 +61,75 @@ EMAIL_MATCH_PATTERN = re.compile(
 UNSET = object()
 
 PropertyType: TypeAlias = property | functools.cached_property
+
+
+class ProviderBindingState(StrEnum):
+	FRESH = "fresh"
+	BOUND = "bound"
+
+
+class ProviderBindingReason(StrEnum):
+	NO_DESCRIPTOR_FOR_BOUND_KIND = "no_descriptor_for_bound_kind"
+	CANONICAL_APP_NOT_INSTALLED = "canonical_app_not_installed"
+	CANONICAL_APP_NOT_ACTIVE = "canonical_app_not_active"
+	INSTALLED_APPLICATION_MISSING = "installed_application_missing"
+	SETUP_COMPLETE_WITHOUT_BINDING = "setup_complete_without_binding"
+	SETUP_INCOMPLETE_WITH_BINDING = "setup_incomplete_with_binding"
+	BINDING_APP_MISMATCH = "binding_app_mismatch"
+	BINDING_VALUE_INVALID = "binding_value_invalid"
+	DESCRIPTOR_MISMATCH = "descriptor_mismatch"
+
+
+@dataclass(frozen=True)
+class LegacyAppAlias:
+	name: str
+	remove_in: str
+
+
+@dataclass(frozen=True)
+class AppProviderDescriptor:
+	schema_version: Literal[1]
+	kind: str
+	canonical_app: str
+	legacy_aliases: tuple[LegacyAppAlias, ...]
+
+
+@dataclass(frozen=True)
+class CapabilityProvider:
+	kind: str
+	canonical_app: str
+	descriptor: AppProviderDescriptor
+	binding_app: str | None
+	state: ProviderBindingState
+
+	def __post_init__(self) -> None:
+		if not isinstance(self.state, ProviderBindingState):
+			raise ProviderContractError("Provider state is invalid")
+		if self.canonical_app != self.descriptor.canonical_app:
+			raise ProviderContractError("Provider canonical app does not match its descriptor")
+		if (self.state is ProviderBindingState.FRESH and self.binding_app is not None) or (
+			self.state is ProviderBindingState.BOUND and self.binding_app != self.canonical_app
+		):
+			raise ProviderContractError("Provider binding does not match its state")
+
+
+class ProviderBindingError(ValidationError):
+	def __init__(self, kind: str, reason: ProviderBindingReason) -> None:
+		self._kind = kind
+		self._reason = reason
+		super().__init__(f"Provider {kind!r} binding is broken: {reason.value}")
+
+	@property
+	def kind(self) -> str:
+		return self._kind
+
+	@property
+	def reason(self) -> ProviderBindingReason:
+		return self._reason
+
+
+class ProviderContractError(ValidationError):
+	pass
 
 
 def get_fullname(user=None):
@@ -1233,6 +1307,239 @@ def get_file_items(path, raise_not_found=False, ignore_empty_lines=True):
 			if (not ignore_empty_lines) or (p.strip() and not p.startswith("#"))
 		]
 	return []
+
+
+_PROVIDER_DESCRIPTOR_FIELDS = {"schema_version", "kind", "canonical_app", "legacy_aliases"}
+_PROVIDER_ALIAS_FIELDS = {"name", "remove_in"}
+
+
+def _provider_contract_error(message: str) -> ProviderContractError:
+	return ProviderContractError(message)
+
+
+def _validate_provider_name(value: object, fieldname: str) -> str:
+	if not isinstance(value, str) or not value or not value.isidentifier():
+		raise _provider_contract_error(f"Provider {fieldname} must be a non-empty Python identifier")
+	return value
+
+
+def _validate_provider_kind(value: object) -> str:
+	if not isinstance(value, str) or not value:
+		raise _provider_contract_error("Provider kind must be a non-empty string")
+	return value
+
+
+def _load_raw_app_provider_descriptor(
+	app_name: str, *, required: bool = False
+) -> AppProviderDescriptor | None:
+	app_name = _validate_provider_name(app_name, "app_name")
+	if app_name not in frappe.get_all_apps():
+		raise _provider_contract_error(f"Provider target app {app_name!r} does not exist")
+
+	try:
+		hooks = importlib.import_module(f"{app_name}.hooks")
+	except ImportError as exc:
+		raise _provider_contract_error(f"Could not import raw hooks for app {app_name!r}") from exc
+
+	raw = getattr(hooks, "frappe_app_provider", None)
+	if raw is None:
+		if required:
+			raise _provider_contract_error(f"App {app_name!r} has no Provider descriptor")
+		return None
+	if not isinstance(raw, dict) or set(raw) != _PROVIDER_DESCRIPTOR_FIELDS:
+		raise _provider_contract_error(f"App {app_name!r} has an invalid Provider descriptor shape")
+	if type(raw["schema_version"]) is not int or raw["schema_version"] != 1:
+		raise _provider_contract_error(f"App {app_name!r} has an unsupported Provider schema")
+
+	kind = _validate_provider_kind(raw["kind"])
+	canonical_app = _validate_provider_name(raw["canonical_app"], "canonical_app")
+	if canonical_app != app_name:
+		raise _provider_contract_error(
+			f"Provider canonical app {canonical_app!r} does not match descriptor app {app_name!r}"
+		)
+
+	raw_aliases = raw["legacy_aliases"]
+	if not isinstance(raw_aliases, list):
+		raise _provider_contract_error("Provider legacy_aliases must be a list")
+
+	aliases = []
+	seen_aliases = set()
+	for raw_alias in raw_aliases:
+		if not isinstance(raw_alias, dict) or set(raw_alias) != _PROVIDER_ALIAS_FIELDS:
+			raise _provider_contract_error(f"App {app_name!r} has an invalid Provider alias")
+		name = _validate_provider_name(raw_alias["name"], "alias name")
+		remove_in = raw_alias["remove_in"]
+		if not isinstance(remove_in, str) or not remove_in:
+			raise _provider_contract_error("Provider alias remove_in must be a non-empty string")
+		if name == canonical_app or name in seen_aliases:
+			raise _provider_contract_error(f"App {app_name!r} has a duplicate or cyclic Provider alias")
+		seen_aliases.add(name)
+		aliases.append(LegacyAppAlias(name=name, remove_in=remove_in))
+
+	return AppProviderDescriptor(
+		schema_version=1,
+		kind=kind,
+		canonical_app=canonical_app,
+		legacy_aliases=tuple(aliases),
+	)
+
+
+@site_cache
+def load_app_provider_descriptor(app_name: str) -> AppProviderDescriptor:
+	descriptor = _load_raw_app_provider_descriptor(app_name, required=True)
+	assert descriptor is not None
+	return descriptor
+
+
+def _get_provider_descriptors() -> tuple[AppProviderDescriptor, ...]:
+	return tuple(
+		descriptor
+		for app_name in frappe.get_all_apps()
+		if (descriptor := _load_raw_app_provider_descriptor(app_name)) is not None
+	)
+
+
+def _get_provider_aliases() -> tuple[set[str], dict[str, str]]:
+	apps = set(frappe.get_all_apps())
+	aliases: dict[str, str] = {}
+	for descriptor in _get_provider_descriptors():
+		for alias in descriptor.legacy_aliases:
+			if alias.name in apps:
+				raise _provider_contract_error(
+					f"Provider alias {alias.name!r} conflicts with a real application"
+				)
+			if alias.name in aliases:
+				raise _provider_contract_error(f"Provider alias {alias.name!r} is declared more than once")
+			aliases[alias.name] = descriptor.canonical_app
+
+	for alias in aliases:
+		seen = set()
+		name = alias
+		while name in aliases:
+			if name in seen:
+				raise _provider_contract_error(f"Provider alias cycle includes {name!r}")
+			seen.add(name)
+			name = aliases[name]
+
+	return apps, aliases
+
+
+@site_cache
+def resolve_app_name(name: str) -> str:
+	name = _validate_provider_name(name, "application name")
+	apps, aliases = _get_provider_aliases()
+	if name in apps:
+		return name
+	return aliases.get(name, name)
+
+
+@site_cache
+def resolve_dotted_path(path: str, *, surface: str) -> str:
+	if not isinstance(surface, str) or not surface:
+		raise _provider_contract_error("Dotted path surface must be a non-empty string")
+	if (
+		not isinstance(path, str)
+		or "." not in path
+		or any(not part.isidentifier() for part in path.split("."))
+	):
+		raise _provider_contract_error(f"Invalid dotted path {path!r}")
+
+	app_name, remainder = path.split(".", 1)
+	return f"{resolve_app_name(app_name)}.{remainder}"
+
+
+def _read_provider_bindings(kind: str) -> dict[str, str]:
+	def reject_duplicate_keys(pairs):
+		bindings = {}
+		for key, value in pairs:
+			if key in bindings:
+				raise ValueError
+			bindings[key] = value
+		return bindings
+
+	raw = frappe.db.get_global("active_app_providers")
+	if raw in (None, ""):
+		return {}
+	try:
+		bindings = json.loads(raw, object_pairs_hook=reject_duplicate_keys)
+	except (TypeError, ValueError):
+		raise ProviderBindingError(kind, ProviderBindingReason.BINDING_VALUE_INVALID) from None
+	if not isinstance(bindings, dict) or any(
+		not isinstance(key, str) or not key or not isinstance(value, str) or not value
+		for key, value in bindings.items()
+	):
+		raise ProviderBindingError(kind, ProviderBindingReason.BINDING_VALUE_INVALID)
+	return bindings
+
+
+def _read_site_apps() -> tuple[set[str], set[str]]:
+	try:
+		installed = json.loads(frappe.db.get_global("installed_apps") or "[]")
+		disabled = json.loads(frappe.db.get_global("disabled_apps") or "[]")
+	except (TypeError, ValueError):
+		raise _provider_contract_error("Installed application state is not valid JSON") from None
+	if (
+		not isinstance(installed, list)
+		or not isinstance(disabled, list)
+		or any(not isinstance(app, str) or not app for app in [*installed, *disabled])
+	):
+		raise _provider_contract_error("Installed application state is invalid")
+	return set(installed), set(installed) - set(disabled)
+
+
+def get_capability_provider(kind: str) -> CapabilityProvider | None:
+	kind = _validate_provider_kind(kind)
+	bindings = _read_provider_bindings(kind)
+	candidates = tuple(descriptor for descriptor in _get_provider_descriptors() if descriptor.kind == kind)
+	if not candidates:
+		if kind in bindings:
+			raise ProviderBindingError(kind, ProviderBindingReason.NO_DESCRIPTOR_FOR_BOUND_KIND)
+		return None
+	if len(candidates) != 1:
+		raise _provider_contract_error(f"More than one Provider declares kind {kind!r}")
+
+	descriptor = candidates[0]
+	canonical_app = descriptor.canonical_app
+	installed_apps, active_apps = _read_site_apps()
+	if canonical_app not in installed_apps:
+		raise ProviderBindingError(kind, ProviderBindingReason.CANONICAL_APP_NOT_INSTALLED)
+	if canonical_app not in active_apps:
+		raise ProviderBindingError(kind, ProviderBindingReason.CANONICAL_APP_NOT_ACTIVE)
+
+	setup_complete = frappe.db.get_value(
+		"Installed Application", {"app_name": canonical_app}, "is_setup_complete"
+	)
+	if setup_complete is None:
+		raise ProviderBindingError(kind, ProviderBindingReason.INSTALLED_APPLICATION_MISSING)
+	if setup_complete not in (0, 1, False, True):
+		raise _provider_contract_error("Installed Application completion state is invalid")
+
+	binding_app = bindings.get(kind)
+	if binding_app is not None and binding_app != canonical_app:
+		raise ProviderBindingError(kind, ProviderBindingReason.BINDING_APP_MISMATCH)
+	if not setup_complete and binding_app is not None:
+		raise ProviderBindingError(kind, ProviderBindingReason.SETUP_INCOMPLETE_WITH_BINDING)
+	if setup_complete and binding_app is None:
+		raise ProviderBindingError(kind, ProviderBindingReason.SETUP_COMPLETE_WITHOUT_BINDING)
+	if not setup_complete:
+		return CapabilityProvider(
+			kind=kind,
+			canonical_app=canonical_app,
+			descriptor=descriptor,
+			binding_app=None,
+			state=ProviderBindingState.FRESH,
+		)
+
+	reloaded_descriptor = _load_raw_app_provider_descriptor(canonical_app, required=True)
+	if reloaded_descriptor != descriptor:
+		raise ProviderBindingError(kind, ProviderBindingReason.DESCRIPTOR_MISMATCH)
+	return CapabilityProvider(
+		kind=kind,
+		canonical_app=canonical_app,
+		descriptor=descriptor,
+		binding_app=canonical_app,
+		state=ProviderBindingState.BOUND,
+	)
 
 
 def get_attr(method_string: str):

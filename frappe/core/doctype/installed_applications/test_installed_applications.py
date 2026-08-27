@@ -1,6 +1,8 @@
 # Copyright (c) 2020, Frappe Technologies and Contributors
 # License: MIT. See LICENSE
 
+from dataclasses import FrozenInstanceError
+from types import ModuleType
 from unittest.mock import MagicMock, patch
 
 import frappe
@@ -10,7 +12,19 @@ from frappe.core.doctype.installed_applications.installed_applications import (
 	update_installed_apps_order,
 )
 from frappe.tests import IntegrationTestCase, UnitTestCase
-from frappe.utils import get_attr
+from frappe.utils import (
+	AppProviderDescriptor,
+	LegacyAppAlias,
+	ProviderBindingError,
+	ProviderBindingReason,
+	ProviderBindingState,
+	ProviderContractError,
+	get_attr,
+	get_capability_provider,
+	load_app_provider_descriptor,
+	resolve_app_name,
+	resolve_dotted_path,
+)
 
 
 class TestInstalledApplications(IntegrationTestCase):
@@ -22,27 +36,21 @@ class TestInstalledApplications(IntegrationTestCase):
 
 
 class TestCurrentApplicationIdentity(UnitTestCase):
-	def test_setup_completion_prefers_anydeals_and_falls_back_to_erpnext(self):
-		for installed_apps, expected in (
-			(["frappe", "anydeals_erp"], ["frappe", "anydeals_erp"]),
-			(["frappe", "erpnext"], ["frappe", "erpnext"]),
+	def test_setup_completion_uses_generic_wizard_rows(self):
+		with (
+			patch.object(frappe.db, "table_exists", return_value=True),
+			patch("frappe.apps.get_disabled_apps", return_value=["disabled_app"]),
+			patch.object(frappe, "get_all", return_value=[1, 1]) as get_all,
 		):
-			with (
-				self.subTest(installed_apps=installed_apps),
-				patch.object(frappe.db, "table_exists", return_value=True),
-				patch("frappe.apps.get_disabled_apps", return_value=[]),
-				patch.object(frappe, "get_installed_apps", return_value=installed_apps),
-				patch.object(frappe, "get_all", return_value=[1, 1]) as get_all,
-			):
-				self.assertTrue(frappe.is_setup_complete.__wrapped__())
+			self.assertTrue(frappe.is_setup_complete.__wrapped__())
 
-			get_all.assert_called_once_with(
-				"Installed Application",
-				{"app_name": ("in", expected)},
-				pluck="is_setup_complete",
-			)
+		get_all.assert_called_once_with(
+			"Installed Application",
+			{"has_setup_wizard": 1, "app_name": ("not in", ["disabled_app"])},
+			pluck="is_setup_complete",
+		)
 
-	def test_installed_applications_treats_anydeals_as_the_current_erp_wizard(self):
+	def test_installed_applications_detects_wizard_apps_from_hooks(self):
 		document = MagicMock()
 		document.get_app_wise_setup_details.return_value = {}
 		rows = []
@@ -50,7 +58,6 @@ class TestCurrentApplicationIdentity(UnitTestCase):
 
 		with (
 			patch.object(frappe, "get_disabled_apps", return_value=[]),
-			patch.object(frappe, "get_installed_apps", return_value=["frappe", "anydeals_erp"]),
 			patch.object(
 				frappe.utils,
 				"get_installed_apps_info",
@@ -60,13 +67,16 @@ class TestCurrentApplicationIdentity(UnitTestCase):
 					{"app_name": "payments", "version": "1"},
 				],
 			),
+			patch.object(
+				frappe,
+				"get_hooks",
+				side_effect=lambda app_name: {
+					"setup_wizard_stages": ["setup"] if app_name == "anydeals_erp" else []
+				},
+			),
 			patch(
 				"frappe.core.doctype.installed_applications.installed_applications.has_non_admin_user",
 				return_value=False,
-			),
-			patch(
-				"frappe.core.doctype.installed_applications.installed_applications.has_company",
-				return_value=True,
 			),
 			patch.object(frappe, "clear_cache"),
 			patch.object(frappe, "is_setup_complete", return_value=True),
@@ -76,7 +86,7 @@ class TestCurrentApplicationIdentity(UnitTestCase):
 
 		self.assertEqual(
 			[(row["app_name"], row["has_setup_wizard"], row["is_setup_complete"]) for row in rows],
-			[("frappe", 1, 0), ("anydeals_erp", 1, 1), ("payments", 0, 0)],
+			[("frappe", 1, 0), ("anydeals_erp", 1, 0), ("payments", 0, 0)],
 		)
 
 	def test_get_attr_rewrites_only_the_legacy_app_prefix(self):
@@ -88,3 +98,307 @@ class TestCurrentApplicationIdentity(UnitTestCase):
 			self.assertIs(get_attr("erpnext.module.target"), module.target)
 
 		get_module.assert_called_once_with("anydeals_erp.module")
+
+
+class TestProviderContract(UnitTestCase):
+	def setUp(self):
+		super().setUp()
+		load_app_provider_descriptor.clear_cache()
+		resolve_app_name.clear_cache()
+		resolve_dotted_path.clear_cache()
+
+	def tearDown(self):
+		load_app_provider_descriptor.clear_cache()
+		resolve_app_name.clear_cache()
+		resolve_dotted_path.clear_cache()
+		super().tearDown()
+
+	@staticmethod
+	def descriptor(
+		canonical_app: str = "virtual_erp", aliases: tuple[str, ...] = ("legacy_erp",)
+	) -> AppProviderDescriptor:
+		return AppProviderDescriptor(
+			schema_version=1,
+			kind="erp",
+			canonical_app=canonical_app,
+			legacy_aliases=tuple(LegacyAppAlias(name=name, remove_in="v19") for name in aliases),
+		)
+
+	@staticmethod
+	def raw_descriptor(**overrides):
+		descriptor = {
+			"schema_version": 1,
+			"kind": "erp",
+			"canonical_app": "virtual_erp",
+			"legacy_aliases": [{"name": "legacy_erp", "remove_in": "v19"}],
+		}
+		descriptor.update(overrides)
+		return descriptor
+
+	def virtual_hooks(self, descriptor=None):
+		module = ModuleType("virtual_erp.hooks")
+		if descriptor is not None:
+			module.frappe_app_provider = descriptor
+		return module
+
+	def provider_patches(
+		self,
+		*,
+		descriptors=None,
+		bindings=None,
+		installed=("virtual_erp",),
+		disabled=(),
+		setup_complete=0,
+		reloaded=None,
+	):
+		descriptors = descriptors if descriptors is not None else (self.descriptor(),)
+		bindings = bindings if bindings is not None else {}
+		globals_by_key = {
+			"active_app_providers": frappe.as_json(bindings),
+			"installed_apps": frappe.as_json(installed),
+			"disabled_apps": frappe.as_json(disabled),
+		}
+		return (
+			patch("frappe.utils._get_provider_descriptors", return_value=descriptors),
+			patch.object(frappe.db, "get_global", side_effect=globals_by_key.get),
+			patch.object(frappe.db, "get_value", return_value=setup_complete),
+			patch(
+				"frappe.utils._load_raw_app_provider_descriptor",
+				return_value=reloaded if reloaded is not None else descriptors[0] if descriptors else None,
+			),
+		)
+
+	def assert_binding_error(self, reason, **state):
+		patches = self.provider_patches(**state)
+		with (
+			patches[0],
+			patches[1],
+			patches[2],
+			patches[3],
+			self.assertRaises(ProviderBindingError) as raised,
+		):
+			get_capability_provider("erp")
+		self.assertEqual((raised.exception.kind, raised.exception.reason), ("erp", reason))
+
+	def test_raw_loader_validates_and_freezes_virtual_app_descriptor(self):
+		module = self.virtual_hooks(self.raw_descriptor())
+		with (
+			patch.object(frappe, "get_all_apps", return_value=["frappe", "virtual_erp"]),
+			patch("frappe.utils.importlib.import_module", return_value=module),
+		):
+			descriptor = load_app_provider_descriptor("virtual_erp")
+
+		self.assertEqual(descriptor, self.descriptor())
+		with self.assertRaises(FrozenInstanceError):
+			descriptor.kind = "other"
+
+	def test_raw_loader_rejects_unknown_schema_and_fields(self):
+		for raw in (
+			self.raw_descriptor(schema_version=2),
+			{**self.raw_descriptor(), "setup_complete": True},
+		):
+			load_app_provider_descriptor.clear_cache()
+			with (
+				self.subTest(raw=raw),
+				patch.object(frappe, "get_all_apps", return_value=["virtual_erp"]),
+				patch("frappe.utils.importlib.import_module", return_value=self.virtual_hooks(raw)),
+				self.assertRaises(ProviderContractError),
+			):
+				load_app_provider_descriptor("virtual_erp")
+
+	def test_alias_resolution_is_exact_and_rejects_conflicts_and_cycles(self):
+		descriptor = self.descriptor()
+		with (
+			patch.object(frappe, "get_all_apps", return_value=["virtual_erp"]),
+			patch("frappe.utils._get_provider_descriptors", return_value=(descriptor,)),
+		):
+			self.assertEqual(resolve_app_name("legacy_erp"), "virtual_erp")
+			self.assertEqual(resolve_app_name("myerpnext"), "myerpnext")
+			self.assertEqual(
+				resolve_dotted_path("legacy_erp.module.method", surface="method"),
+				"virtual_erp.module.method",
+			)
+			self.assertEqual(
+				resolve_dotted_path("myerpnext.module.method", surface="method"),
+				"myerpnext.module.method",
+			)
+
+		resolve_app_name.clear_cache()
+		with (
+			patch.object(frappe, "get_all_apps", return_value=["legacy_erp", "virtual_erp"]),
+			patch("frappe.utils._get_provider_descriptors", return_value=(descriptor,)),
+			self.assertRaises(ProviderContractError),
+		):
+			resolve_app_name("legacy_erp")
+
+		cycle = (
+			self.descriptor("provider_a", ("provider_b",)),
+			self.descriptor("provider_b", ("provider_a",)),
+		)
+		with (
+			patch.object(frappe, "get_all_apps", return_value=[]),
+			patch("frappe.utils._get_provider_descriptors", return_value=cycle),
+			self.assertRaises(ProviderContractError),
+		):
+			resolve_app_name.__wrapped__("provider_a")
+
+	def test_invalid_dotted_path_fails_closed(self):
+		for path in ("legacy_erp", "legacy_erp..method", "https://example.com", "a@b.com"):
+			with self.subTest(path=path), self.assertRaises(ProviderContractError):
+				resolve_dotted_path(path, surface="method")
+
+	def test_no_provider_and_fresh_and_bound_states(self):
+		patches = self.provider_patches(descriptors=())
+		with patches[0], patches[1], patches[2], patches[3]:
+			self.assertIsNone(get_capability_provider("erp"))
+
+		patches = self.provider_patches()
+		with patches[0], patches[1], patches[2], patches[3]:
+			provider = get_capability_provider("erp")
+		self.assertEqual(
+			(provider.state, provider.binding_app),
+			(ProviderBindingState.FRESH, None),
+		)
+
+		patches = self.provider_patches(bindings={"erp": "virtual_erp"}, setup_complete=1)
+		with patches[0], patches[1], patches[2], patches[3]:
+			provider = get_capability_provider("erp")
+		self.assertEqual(
+			(provider.state, provider.binding_app),
+			(ProviderBindingState.BOUND, "virtual_erp"),
+		)
+
+	def test_binding_failures_have_stable_reasons(self):
+		self.assert_binding_error(
+			ProviderBindingReason.NO_DESCRIPTOR_FOR_BOUND_KIND,
+			descriptors=(),
+			bindings={"erp": "virtual_erp"},
+		)
+		self.assert_binding_error(
+			ProviderBindingReason.CANONICAL_APP_NOT_INSTALLED,
+			installed=(),
+		)
+		self.assert_binding_error(
+			ProviderBindingReason.CANONICAL_APP_NOT_ACTIVE,
+			disabled=("virtual_erp",),
+		)
+		self.assert_binding_error(
+			ProviderBindingReason.INSTALLED_APPLICATION_MISSING,
+			setup_complete=None,
+		)
+		self.assert_binding_error(
+			ProviderBindingReason.SETUP_COMPLETE_WITHOUT_BINDING,
+			setup_complete=1,
+		)
+		self.assert_binding_error(
+			ProviderBindingReason.SETUP_INCOMPLETE_WITH_BINDING,
+			bindings={"erp": "virtual_erp"},
+		)
+		self.assert_binding_error(
+			ProviderBindingReason.BINDING_APP_MISMATCH,
+			bindings={"erp": "other_erp"},
+		)
+
+		for bindings in ('{"erp": 1}', '{"erp": "virtual_erp", "erp": "other_erp"}'):
+			patches = self.provider_patches()
+			with (
+				self.subTest(bindings=bindings),
+				patches[0],
+				patch.object(frappe.db, "get_global", return_value=bindings),
+				patches[2],
+				patches[3],
+				self.assertRaises(ProviderBindingError) as raised,
+			):
+				get_capability_provider("erp")
+			self.assertEqual(raised.exception.reason, ProviderBindingReason.BINDING_VALUE_INVALID)
+
+		self.assert_binding_error(
+			ProviderBindingReason.DESCRIPTOR_MISMATCH,
+			bindings={"erp": "virtual_erp"},
+			setup_complete=1,
+			reloaded=self.descriptor(aliases=()),
+		)
+
+	def test_duplicate_provider_fails_closed(self):
+		descriptors = (self.descriptor("virtual_erp"), self.descriptor("second_erp"))
+		patches = self.provider_patches(descriptors=descriptors)
+		with patches[0], patches[1], patches[2], patches[3], self.assertRaises(ProviderContractError):
+			get_capability_provider("erp")
+
+	def test_binding_state_is_never_cached(self):
+		descriptor = self.descriptor()
+		state = {"binding": {}, "complete": 0}
+
+		def get_global(key):
+			return frappe.as_json(
+				{
+					"active_app_providers": state["binding"],
+					"installed_apps": ["virtual_erp"],
+					"disabled_apps": [],
+				}[key]
+			)
+
+		with (
+			patch("frappe.utils._get_provider_descriptors", return_value=(descriptor,)),
+			patch.object(frappe.db, "get_global", side_effect=get_global),
+			patch.object(frappe.db, "get_value", side_effect=lambda *args: state["complete"]),
+			patch("frappe.utils._load_raw_app_provider_descriptor", return_value=descriptor),
+		):
+			self.assertEqual(get_capability_provider("erp").state, ProviderBindingState.FRESH)
+			state.update(binding={"erp": "virtual_erp"}, complete=1)
+			self.assertEqual(get_capability_provider("erp").state, ProviderBindingState.BOUND)
+
+	def test_site_cache_isolated_and_clear_cache_reloads_descriptor(self):
+		import frappe.cache_manager
+		import frappe.website.router
+
+		clear_provider_caches = frappe.clear_cache
+		original_site = frappe.local.site
+		modules = {
+			"site-one": self.virtual_hooks(self.raw_descriptor()),
+			"site-two": self.virtual_hooks(self.raw_descriptor(legacy_aliases=[])),
+		}
+		try:
+			with (
+				patch.object(frappe, "get_all_apps", return_value=["virtual_erp"]),
+				patch(
+					"frappe.utils.importlib.import_module",
+					side_effect=lambda *args: modules[frappe.local.site],
+				) as import_module,
+			):
+				frappe.local.site = "site-one"
+				self.assertEqual(len(load_app_provider_descriptor("virtual_erp").legacy_aliases), 1)
+				frappe.local.site = "site-two"
+				self.assertEqual(len(load_app_provider_descriptor("virtual_erp").legacy_aliases), 0)
+				frappe.local.site = "site-one"
+				load_app_provider_descriptor("virtual_erp")
+				self.assertEqual(import_module.call_count, 2)
+
+				modules["site-one"] = self.virtual_hooks(self.raw_descriptor(legacy_aliases=[]))
+				with (
+					patch.object(frappe.cache, "get_keys", return_value=[]),
+					patch.object(frappe.cache, "delete_value"),
+					patch.object(frappe, "get_hooks", return_value=[]),
+					patch.object(frappe.cache_manager, "reset_metadata_version"),
+					patch.object(frappe.client_cache, "clear_cache"),
+					patch.object(frappe.website.router, "clear_routing_cache"),
+				):
+					clear_provider_caches()
+				self.assertEqual(len(load_app_provider_descriptor("virtual_erp").legacy_aliases), 0)
+		finally:
+			frappe.local.site = original_site
+
+	def test_migrate_setup_uses_the_same_cache_invalidation_path(self):
+		from frappe.migrate import SiteMigration
+
+		migration = SiteMigration()
+		with (
+			patch.object(frappe, "get_site_path", return_value="/tmp/provider-touched-tables.json"),
+			patch.object(frappe, "clear_cache") as clear_cache,
+			patch("frappe.migrate.os.path.exists", return_value=False),
+			patch.object(migration, "lower_lock_timeout"),
+			patch.object(migration, "kill_idle_connections"),
+		):
+			migration.setUp()
+
+		clear_cache.assert_called_once_with()
