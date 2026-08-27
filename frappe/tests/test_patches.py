@@ -49,6 +49,16 @@ app.module.patch4
 
 
 class TestPatches(IntegrationTestCase):
+	def test_legacy_and_canonical_patch_paths_are_currently_distinct(self):
+		with (
+			patch.object(frappe, "get_all", return_value=["erpnext.patches.example"]),
+			patch.object(patch_handler, "get_all_patches", return_value=["anydeals_erp.patches.example"]),
+			patch.object(patch_handler, "run_single", return_value=True) as run_single,
+		):
+			patch_handler.run_all()
+
+		run_single.assert_called_once_with(patchmodule="anydeals_erp.patches.example")
+
 	def test_patch_module_names(self):
 		frappe.flags.final_patches = []
 		frappe.flags.in_install = True

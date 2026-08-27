@@ -13,6 +13,7 @@ from frappe.utils.legacy_gravatar_cleanup import (
 	SKIP_GRAVATAR_DELETION_PROMPT,
 	Action,
 	delete_gravatar_image_urls,
+	get_gravatar_image_fields,
 	has_gravatar_image_urls,
 	should_show_gravatar_deletion_prompt,
 	skip_gravatar_deletion_prompt_if_no_urls,
@@ -37,6 +38,19 @@ def skip_gravatar_deletion_prompt(value):
 
 
 class TestGravatarDeletion(IntegrationTestCase):
+	def test_current_erp_identities_add_the_lead_image_field(self):
+		for installed_apps, expected in (
+			(["frappe"], [("User", "user_image"), ("Contact", "image")]),
+			(["frappe", "erpnext"], [("User", "user_image"), ("Contact", "image"), ("Lead", "image")]),
+			(
+				["frappe", "anydeals_erp"],
+				[("User", "user_image"), ("Contact", "image"), ("Lead", "image")],
+			),
+		):
+			with self.subTest(installed_apps=installed_apps):
+				with patch.object(frappe, "get_installed_apps", return_value=installed_apps):
+					self.assertEqual(get_gravatar_image_fields(), expected)
+
 	def test_delete_gravatar_image_urls(self):
 		user, contact, lead = self.create_gravatar_records()
 
@@ -124,7 +138,7 @@ class TestGravatarDeletion(IntegrationTestCase):
 		frappe.db.set_value("User", user.name, "user_image", gravatar_url, update_modified=False)
 
 		lead = None
-		if "erpnext" in frappe.get_installed_apps():
+		if {"anydeals_erp", "erpnext"} & set(frappe.get_installed_apps()):
 			lead = frappe.get_doc(
 				doctype="Lead",
 				first_name="Gravatar",

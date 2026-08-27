@@ -100,3 +100,87 @@ class TestCompleteAppSetup(IntegrationTestCase):
 				self.assertRaises(frappe.ValidationError, setup_wizard.complete_app_setup)
 			with patch.object(frappe, "is_setup_complete", return_value=True):
 				self.assertEqual(setup_wizard.complete_app_setup(), {"status": "ok"})
+
+
+class TestCurrentSetupStageBehavior(UnitTestCase):
+	def test_tasks_are_marked_complete_before_the_current_success_tail(self):
+		events = []
+		stages = [
+			{
+				"tasks": [
+					{
+						"fn": lambda args: events.append("task:anydeals_erp"),
+						"args": {},
+						"app_name": "anydeals_erp",
+					},
+					{"fn": lambda args: events.append("task:frappe"), "args": {}},
+				]
+			}
+		]
+
+		with (
+			patch.object(setup_wizard, "get_setup_wizard_completed_apps", return_value=[]),
+			patch.object(frappe, "publish_realtime"),
+			patch.object(
+				setup_wizard,
+				"enable_setup_wizard_complete",
+				side_effect=lambda app: events.append(f"complete:{app}"),
+			),
+			patch.object(
+				setup_wizard, "run_setup_success", side_effect=lambda args: events.append("success")
+			),
+			patch.object(
+				setup_wizard,
+				"apply_telemetry_preference",
+				side_effect=lambda enabled: events.append("preference"),
+			),
+			patch.object(
+				setup_wizard,
+				"clear_cache_after_maintenance",
+				side_effect=lambda: events.append("clear-cache"),
+			),
+			patch(
+				"frappe.utils.telemetry.capture",
+				side_effect=lambda event, source, **kwargs: events.append(f"capture:{event}"),
+			),
+		):
+			self.assertEqual(setup_wizard.process_setup_stages(stages, {}), {"status": "ok"})
+
+		self.assertEqual(
+			events,
+			[
+				"capture:initiated_server_side",
+				"task:anydeals_erp",
+				"complete:anydeals_erp",
+				"task:frappe",
+				"complete:frappe",
+				"success",
+				"capture:completed_server_side",
+				"preference",
+				"clear-cache",
+			],
+		)
+
+	def test_current_wrapping_task_commits(self):
+		with (
+			patch.object(setup_wizard, "disable_future_access"),
+			patch.object(frappe.db, "commit") as commit,
+			patch.object(frappe, "clear_cache"),
+			patch.object(frappe, "get_cached_doc", return_value=None),
+		):
+			setup_wizard.run_post_setup_complete({})
+
+		commit.assert_called_once_with()
+
+	def test_current_success_tail_failure_bypasses_the_stage_failure_handler(self):
+		with (
+			patch.object(setup_wizard, "get_setup_wizard_completed_apps", return_value=[]),
+			patch.object(setup_wizard, "run_setup_success", side_effect=RuntimeError("late failure")),
+			patch.object(setup_wizard, "handle_setup_exception") as handle_setup_exception,
+			patch.object(setup_wizard, "clear_cache_after_maintenance"),
+			patch("frappe.utils.telemetry.capture"),
+		):
+			with self.assertRaisesRegex(RuntimeError, "late failure"):
+				setup_wizard.process_setup_stages([], {})
+
+		handle_setup_exception.assert_not_called()

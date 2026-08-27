@@ -12,6 +12,7 @@ from frappe.utils.background_jobs import (
 	RQ_JOB_FAILURE_TTL,
 	RQ_RESULTS_TTL,
 	create_job_id,
+	enqueue,
 	execute_job,
 	generate_qname,
 	get_redis_conn,
@@ -19,6 +20,14 @@ from frappe.utils.background_jobs import (
 
 
 class TestBackgroundJobs(IntegrationTestCase):
+	def test_queue_payload_currently_preserves_a_legacy_method_path(self):
+		queue = Queue(connection=get_redis_conn())
+		with patch("frappe.utils.background_jobs.get_queue", return_value=queue):
+			with patch.object(queue, "enqueue_call", return_value=object()) as enqueue_call:
+				enqueue("erpnext.utilities.get_site_info")
+
+		self.assertEqual(enqueue_call.call_args.kwargs["kwargs"]["method"], "erpnext.utilities.get_site_info")
+
 	def test_remove_failed_jobs(self):
 		frappe.enqueue(method="frappe.tests.test_background_jobs.fail_function", queue="short")
 		# wait for enqueued job to execute
