@@ -11,7 +11,7 @@ from frappe.core.doctype.installed_applications.installed_applications import ge
 from frappe.geo.country_info import get_country_info
 from frappe.permissions import AUTOMATIC_ROLES
 from frappe.translate import send_translations, set_default_language
-from frappe.utils import cint, now, strip
+from frappe.utils import ProviderBindingState, ProviderContractError, cint, now, strip
 from frappe.utils.password import update_password
 from frappe.utils.synchronization import LockTimeoutError, filelock
 
@@ -161,68 +161,143 @@ def process_setup_stages(stages, user_input, is_background_task=False):
 
 	setup_wizard_completed_apps = get_setup_wizard_completed_apps()
 	telemetry_enabled = bool(cint(user_input.get("enable_telemetry")))
+	provider = get_setup_provider(stages)
 
 	capture("initiated_server_side", "setup")
+	frappe.flags.in_setup_wizard = True
+	frappe.flags.in_provider_setup = provider is not None
 	try:
-		frappe.flags.in_setup_wizard = True
-		current_task = None
-		for idx, stage in enumerate(stages):
-			frappe.publish_realtime(
-				"setup_task",
-				{"progress": [idx, len(stages)], "stage_status": stage.get("status")},
-				user=frappe.session.user,
+		try:
+			current_task = None
+			for idx, stage in enumerate(stages):
+				frappe.publish_realtime(
+					"setup_task",
+					{"progress": [idx, len(stages)], "stage_status": stage.get("status")},
+					user=frappe.session.user,
+				)
+
+				for task in stage.get("tasks"):
+					current_task = task
+					if task.get("app_name") and task.get("app_name") in setup_wizard_completed_apps:
+						continue
+
+					if "frappe" in setup_wizard_completed_apps:
+						set_missing_values(task)
+
+					task.get("fn")(task.get("args"))
+
+					if task.get("app_name") and (
+						not provider or task.get("app_name") != provider.canonical_app
+					):
+						enable_setup_wizard_complete(task.get("app_name"))
+					elif not task.get("app_name"):
+						enable_setup_wizard_complete("frappe")
+		except Exception:
+			message = current_task.get("fail_msg") if current_task else "Failed to complete setup"
+			report_setup_failure(user_input, telemetry_enabled, message, is_background_task, capture)
+			if not is_background_task:
+				raise
+			return
+
+		if not provider:
+			return run_setup_success_tail(
+				user_input, telemetry_enabled, is_background_task, capture, provider=None
 			)
 
-			for task in stage.get("tasks"):
-				current_task = task
-				if task.get("app_name") and task.get("app_name") in setup_wizard_completed_apps:
-					continue
-
-				if "frappe" in setup_wizard_completed_apps:
-					set_missing_values(task)
-
-				task.get("fn")(task.get("args"))
-
-				if task.get("app_name"):
-					enable_setup_wizard_complete(task.get("app_name"))
-				else:
-					enable_setup_wizard_complete("frappe")
-	except Exception:
-		handle_setup_exception(user_input)
-		message = current_task.get("fail_msg") if current_task else "Failed to complete setup"
-		capture(
-			"setup_failed",
-			"setup",
-			properties={
-				"telemetry_enabled": telemetry_enabled,
-				"stage": message,
-			},
-		)
-		frappe.log_error(title=f"Setup failed: {message}")
-		if not is_background_task:
-			frappe.response["setup_wizard_failure_message"] = message
-			raise
-		frappe.publish_realtime(
-			"setup_task",
-			{"status": "fail", "fail_msg": message},
-			user=frappe.session.user,
-		)
-	else:
-		run_setup_success(user_input)
-		capture(
-			"completed_server_side",
-			"setup",
-			properties={
-				"telemetry_enabled": telemetry_enabled,
-			},
-		)
-		apply_telemetry_preference(telemetry_enabled)
-		if not is_background_task:
-			return {"status": "ok"}
-		frappe.publish_realtime("setup_task", {"status": "ok"}, user=frappe.session.user)
+		try:
+			return run_setup_success_tail(
+				user_input, telemetry_enabled, is_background_task, capture, provider
+			)
+		except Exception:
+			report_setup_failure(
+				user_input, telemetry_enabled, "Failed to complete setup", is_background_task, capture
+			)
+			if not is_background_task:
+				raise
 	finally:
 		frappe.flags.in_setup_wizard = False
+		frappe.flags.in_provider_setup = False
 		clear_cache_after_maintenance()
+
+
+def run_setup_success_tail(user_input, telemetry_enabled, is_background_task, capture, provider):
+	run_setup_success(user_input)
+	if provider:
+		finalize_provider(provider)
+		clear_setup_complete_request_cache()
+		if not frappe.is_setup_complete():
+			raise ProviderContractError("Provider finalizer did not complete setup")
+	capture(
+		"completed_server_side",
+		"setup",
+		properties={
+			"telemetry_enabled": telemetry_enabled,
+		},
+	)
+	apply_telemetry_preference(telemetry_enabled)
+	if not is_background_task:
+		return {"status": "ok"}
+	frappe.publish_realtime("setup_task", {"status": "ok"}, user=frappe.session.user)
+
+
+def report_setup_failure(user_input, telemetry_enabled, message, is_background_task, capture):
+	handle_setup_exception(user_input)
+	capture(
+		"setup_failed",
+		"setup",
+		properties={
+			"telemetry_enabled": telemetry_enabled,
+			"stage": message,
+		},
+	)
+	frappe.log_error(title=f"Setup failed: {message}")
+	if not is_background_task:
+		frappe.response["setup_wizard_failure_message"] = message
+		return
+	frappe.publish_realtime(
+		"setup_task",
+		{"status": "fail", "fail_msg": message},
+		user=frappe.session.user,
+	)
+
+
+def get_setup_provider(stages):
+	provider_apps = {
+		descriptor.canonical_app: descriptor.kind for descriptor in frappe.utils._get_provider_descriptors()
+	}
+	setup_provider_kinds = {
+		provider_apps[app_name]
+		for stage in stages
+		for task in stage.get("tasks")
+		if (app_name := task.get("app_name")) in provider_apps
+	}
+	if len(setup_provider_kinds) > 1:
+		raise ProviderContractError("Setup has more than one Provider")
+	if not setup_provider_kinds:
+		return None
+
+	provider = frappe.utils.get_capability_provider(setup_provider_kinds.pop())
+	if provider and provider.state is ProviderBindingState.FRESH:
+		return provider
+	return None
+
+
+def finalize_provider(provider):
+	frappe.db.set_value(
+		"Installed Application",
+		{"app_name": provider.canonical_app},
+		"is_setup_complete",
+		1,
+	)
+	bindings = json.loads(frappe.db.get_global("active_app_providers") or "{}")
+	bindings[provider.kind] = provider.canonical_app
+	frappe.db.set_global("active_app_providers", frappe.as_json(bindings))
+	frappe.db.set_single_value("System Settings", "setup_complete", 1)
+
+
+def clear_setup_complete_request_cache():
+	if (request_cache := getattr(frappe.local, "request_cache", None)) is not None:
+		request_cache.pop(frappe.is_setup_complete.__wrapped__, None)
 
 
 def set_missing_values(task):
@@ -261,7 +336,8 @@ def apply_telemetry_preference(telemetry_enabled):
 
 def run_post_setup_complete(args):  # nosemgrep
 	disable_future_access()
-	frappe.db.commit()
+	if not frappe.flags.in_provider_setup:
+		frappe.db.commit()
 	frappe.clear_cache()
 	# HACK: due to race condition sometimes old doc stays in cache.
 	# Remove this when we have reliable cache reset for docs
