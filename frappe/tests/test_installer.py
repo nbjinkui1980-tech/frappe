@@ -22,8 +22,10 @@ class TestStrictInstalledAppsMirror(UnitTestCase):
 
 	def _call(self, *, readback=None):
 		if readback is None:
+
 			def readback(**kwargs):
 				return frappe._dict(json.loads(self.config.read_text(encoding="utf-8")))
+
 		with (
 			patch("frappe.installer.get_site_config_path", return_value=str(self.config)),
 			patch("frappe.installer.filelock", return_value=nullcontext()),
