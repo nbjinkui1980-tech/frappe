@@ -13,6 +13,7 @@ from frappe.core.doctype.installed_applications.installed_applications import (
 )
 from frappe.tests import IntegrationTestCase, UnitTestCase
 from frappe.utils import (
+	AliasSurface,
 	AppProviderDescriptor,
 	LegacyAppAlias,
 	ProviderBindingError,
@@ -22,6 +23,7 @@ from frappe.utils import (
 	get_attr,
 	get_capability_provider,
 	load_app_provider_descriptor,
+	record_app_alias_usage,
 	resolve_app_name,
 	resolve_dotted_path,
 )
@@ -225,6 +227,7 @@ class TestProviderContract(UnitTestCase):
 		with (
 			patch.object(frappe, "get_all_apps", return_value=["virtual_erp"]),
 			patch("frappe.utils._get_provider_descriptors", return_value=(descriptor,)),
+			patch("frappe.utils.record_app_alias_usage") as record_usage,
 		):
 			self.assertEqual(resolve_app_name("legacy_erp"), "virtual_erp")
 			self.assertEqual(resolve_app_name("myerpnext"), "myerpnext")
@@ -236,6 +239,7 @@ class TestProviderContract(UnitTestCase):
 				resolve_dotted_path("myerpnext.module.method", surface="method"),
 				"myerpnext.module.method",
 			)
+			record_usage.assert_called_once_with("legacy_erp", "virtual_erp", AliasSurface.METHOD, __name__)
 
 		resolve_app_name.clear_cache()
 		with (
@@ -260,6 +264,35 @@ class TestProviderContract(UnitTestCase):
 		for path in ("legacy_erp", "legacy_erp..method", "https://example.com", "a@b.com"):
 			with self.subTest(path=path), self.assertRaises(ProviderContractError):
 				resolve_dotted_path(path, surface="method")
+
+		with self.assertRaises(ProviderContractError):
+			resolve_dotted_path("legacy_erp.module.method", surface="unknown")
+
+	def test_alias_usage_sink_is_best_effort_and_site_scoped(self):
+		hooks = ModuleType("virtual_erp.hooks")
+		hooks.app_alias_usage_sink = "virtual_erp.telemetry.record"
+		sink = MagicMock(side_effect=RuntimeError("redis unavailable"))
+		logger = MagicMock()
+		with (
+			patch.object(frappe.local, "site", "test.local"),
+			patch.object(frappe, "get_installed_apps", return_value=["virtual_erp"]),
+			patch("frappe.utils.importlib.import_module", return_value=hooks),
+			patch.object(frappe, "get_attr", return_value=sink),
+			patch.object(frappe, "logger", return_value=logger),
+		):
+			self.assertIsNone(
+				record_app_alias_usage("legacy_erp", "virtual_erp", AliasSurface.API, "frappe.handler")
+			)
+
+		sink.assert_called_once_with("legacy_erp", "virtual_erp", AliasSurface.API, "frappe.handler")
+		logger.warning.assert_called_once()
+
+		with (
+			patch.object(frappe.local, "site", None),
+			patch.object(frappe, "get_installed_apps") as get_installed_apps,
+		):
+			record_app_alias_usage("legacy_erp", "virtual_erp", AliasSurface.API, "frappe.handler")
+		get_installed_apps.assert_not_called()
 
 	def test_no_provider_and_fresh_and_bound_states(self):
 		patches = self.provider_patches(descriptors=())

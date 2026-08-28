@@ -68,6 +68,15 @@ class ProviderBindingState(StrEnum):
 	BOUND = "bound"
 
 
+class AliasSurface(StrEnum):
+	METHOD = "method"
+	API = "api"
+	QUEUE_WRITE = "queue_write"
+	QUEUE_READ = "queue_read"
+	PATCH_LOG = "patch_log"
+	PERSISTED_SCAN = "persisted_scan"
+
+
 class ProviderBindingReason(StrEnum):
 	NO_DESCRIPTOR_FOR_BOUND_KIND = "no_descriptor_for_bound_kind"
 	CANONICAL_APP_NOT_INSTALLED = "canonical_app_not_installed"
@@ -1439,8 +1448,10 @@ def resolve_app_name(name: str) -> str:
 
 @site_cache
 def resolve_dotted_path(path: str, *, surface: str) -> str:
-	if not isinstance(surface, str) or not surface:
-		raise _provider_contract_error("Dotted path surface must be a non-empty string")
+	try:
+		surface = AliasSurface(surface)
+	except (TypeError, ValueError):
+		raise _provider_contract_error(f"Invalid dotted path surface {surface!r}") from None
 	if (
 		not isinstance(path, str)
 		or "." not in path
@@ -1449,7 +1460,31 @@ def resolve_dotted_path(path: str, *, surface: str) -> str:
 		raise _provider_contract_error(f"Invalid dotted path {path!r}")
 
 	app_name, remainder = path.split(".", 1)
-	return f"{resolve_app_name(app_name)}.{remainder}"
+	canonical_app = resolve_app_name(app_name)
+	if canonical_app != app_name:
+		frame = sys._getframe(1)
+		while frame and frame.f_globals.get("__name__") == "frappe.utils.caching":
+			frame = frame.f_back
+		caller = frame.f_globals.get("__name__", "") if frame else ""
+		record_app_alias_usage(app_name, canonical_app, surface, caller)
+	return f"{canonical_app}.{remainder}"
+
+
+def record_app_alias_usage(alias: str, canonical_app: str, surface: AliasSurface, caller: str) -> None:
+	if not getattr(frappe.local, "site", None):
+		return
+
+	for app_name in frappe.get_installed_apps(_ensure_on_bench=True):
+		try:
+			hooks = importlib.import_module(f"{app_name}.hooks")
+			sink_path = getattr(hooks, "app_alias_usage_sink", None)
+			if not sink_path:
+				continue
+			frappe.get_attr(sink_path)(alias, canonical_app, surface, caller)
+		except Exception:
+			frappe.logger("app_alias_usage").warning(
+				"App alias usage sink failed for app %s", app_name, exc_info=True
+			)
 
 
 def _read_provider_bindings(kind: str) -> dict[str, str]:

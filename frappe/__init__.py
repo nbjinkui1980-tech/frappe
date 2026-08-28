@@ -92,6 +92,7 @@ _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
 	"get_attr": ("frappe.utils", "get_attr"),
 	"get_capability_provider": ("frappe.utils", "get_capability_provider"),
 	"load_app_provider_descriptor": ("frappe.utils", "load_app_provider_descriptor"),
+	"record_app_alias_usage": ("frappe.utils", "record_app_alias_usage"),
 	"resolve_app_name": ("frappe.utils", "resolve_app_name"),
 	"resolve_dotted_path": ("frappe.utils", "resolve_dotted_path"),
 	# frappe.utils.background_jobs
@@ -205,6 +206,7 @@ if TYPE_CHECKING:  # pragma: no cover
 		mock,
 		parse_json,
 		read_file,
+		record_app_alias_usage,
 		resolve_app_name,
 		resolve_dotted_path,
 		safe_eval,
