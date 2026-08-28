@@ -65,6 +65,8 @@ def handle():
 
 def execute_cmd(cmd, from_async=False):
 	"""execute a request as python module"""
+	if "." in cmd:
+		cmd = frappe.resolve_dotted_path(cmd, surface="api")
 	cmd = frappe.override_whitelisted_method(cmd)
 
 	# via server script

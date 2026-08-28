@@ -17,7 +17,6 @@ BASE_GRAVATAR_IMAGE_FIELDS = (
 	("User", "user_image"),
 	("Contact", "image"),
 )
-ERPNEXT_GRAVATAR_IMAGE_FIELDS = (("Lead", "image"),)
 
 
 class Action(Enum):
@@ -27,8 +26,17 @@ class Action(Enum):
 
 def get_gravatar_image_fields():
 	fields = list(BASE_GRAVATAR_IMAGE_FIELDS)
-	if {"anydeals_erp", "erpnext"} & set(frappe.get_installed_apps()):
-		fields.extend(ERPNEXT_GRAVATAR_IMAGE_FIELDS)
+	for item in frappe.get_hooks("legacy_gravatar_image_fields"):
+		if not (
+			isinstance(item, tuple)
+			and len(item) == 2
+			and all(isinstance(value, str) and value for value in item)
+		):
+			raise frappe.ValidationError(
+				"legacy_gravatar_image_fields entries must be static (doctype, fieldname) tuples"
+			)
+		if item not in fields:
+			fields.append(item)
 	return fields
 
 

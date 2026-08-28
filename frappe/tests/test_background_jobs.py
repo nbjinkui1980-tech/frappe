@@ -11,6 +11,7 @@ from frappe.tests import IntegrationTestCase
 from frappe.utils.background_jobs import (
 	RQ_JOB_FAILURE_TTL,
 	RQ_RESULTS_TTL,
+	_resolve_job_callable,
 	create_job_id,
 	enqueue,
 	execute_job,
@@ -19,14 +20,84 @@ from frappe.utils.background_jobs import (
 )
 
 
-class TestBackgroundJobs(IntegrationTestCase):
-	def test_queue_payload_currently_preserves_a_legacy_method_path(self):
-		queue = Queue(connection=get_redis_conn())
-		with patch("frappe.utils.background_jobs.get_queue", return_value=queue):
-			with patch.object(queue, "enqueue_call", return_value=object()) as enqueue_call:
-				enqueue("erpnext.utilities.get_site_info")
+class JobTarget:
+	def run(self):
+		return "done"
 
-		self.assertEqual(enqueue_call.call_args.kwargs["kwargs"]["method"], "erpnext.utilities.get_site_info")
+
+class TestBackgroundJobs(IntegrationTestCase):
+	def test_queue_payload_writes_canonical_method_and_callbacks(self):
+		queue = Queue(connection=get_redis_conn())
+
+		def resolve(path, *, surface):
+			self.assertEqual(surface, "queue_write")
+			return path.replace("legacy_app.", "canonical_app.", 1)
+
+		with (
+			patch.object(frappe, "resolve_dotted_path", side_effect=resolve),
+			patch("frappe.utils.background_jobs.get_queue", return_value=queue),
+		):
+			with patch.object(queue, "enqueue_call", return_value=object()) as enqueue_call:
+				enqueue(
+					"legacy_app.jobs.run",
+					on_success="legacy_app.jobs.success",
+					on_failure="legacy_app.jobs.failure",
+				)
+
+		call = enqueue_call.call_args.kwargs
+		self.assertEqual(call["kwargs"]["method"], "canonical_app.jobs.run")
+		self.assertEqual(call["on_success"].func, "canonical_app.jobs.success")
+		self.assertEqual(call["on_failure"].func, "canonical_app.jobs.failure")
+
+	def test_now_resolves_method_before_direct_execution(self):
+		with (
+			patch.object(
+				frappe,
+				"resolve_dotted_path",
+				return_value="canonical_app.jobs.run",
+			) as resolve_dotted_path,
+			patch.object(frappe, "call", return_value="done") as call,
+		):
+			self.assertEqual(enqueue("legacy_app.jobs.run", now=True), "done")
+
+		resolve_dotted_path.assert_called_once_with("legacy_app.jobs.run", surface="queue_write")
+		call.assert_called_once_with("canonical_app.jobs.run")
+
+	def test_bound_method_is_re_resolved_without_losing_its_instance(self):
+		target = JobTarget()
+		resolved, path = _resolve_job_callable(target.run, surface="queue_write")
+
+		self.assertEqual(path, f"{__name__}.JobTarget.run")
+		self.assertIs(resolved.__self__, target)
+		self.assertIs(resolved.__func__, JobTarget.run)
+
+	def test_worker_resolves_legacy_payload_before_lookup(self):
+		def method():
+			return "done"
+
+		with (
+			patch.object(
+				frappe,
+				"resolve_dotted_path",
+				return_value="canonical_app.jobs.run",
+			) as resolve_dotted_path,
+			patch.object(frappe, "get_attr", return_value=method) as get_attr,
+			patch.object(frappe, "get_hooks", return_value=[]),
+		):
+			self.assertEqual(
+				execute_job(
+					site=frappe.local.site,
+					method="legacy_app.jobs.run",
+					event=None,
+					job_name="legacy_app.jobs.run",
+					kwargs={},
+					is_async=False,
+				),
+				"done",
+			)
+
+		resolve_dotted_path.assert_called_once_with("legacy_app.jobs.run", surface="queue_read")
+		get_attr.assert_called_once_with("canonical_app.jobs.run")
 
 	def test_remove_failed_jobs(self):
 		frappe.enqueue(method="frappe.tests.test_background_jobs.fail_function", queue="short")

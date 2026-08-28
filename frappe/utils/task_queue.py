@@ -3,7 +3,7 @@ from typing import TYPE_CHECKING
 from uuid import uuid4
 
 import frappe
-from frappe import _
+from frappe.utils.background_jobs import _resolve_job_callable
 
 if TYPE_CHECKING:
 	from frappe.core.doctype.background_task.background_task import BackgroundTask
@@ -33,13 +33,9 @@ def enqueue_task(
 	**kwargs,
 ) -> "BackgroundTask":
 	"""A wrapper around frappe.enqueue. Enqueue a background job with user-facing tracking"""
-	if isinstance(method, Callable):
-		method_name = f"{method.__module__}.{method.__qualname__}"
-	else:
-		method_name = method
-
-	on_success_path = _callback_path(on_success)
-	on_failure_path = _callback_path(on_failure)
+	method_name = _resolve_job_callable(method, surface="queue_write")[1]
+	on_success_path = _callback_path(on_success, surface="queue_write")
+	on_failure_path = _callback_path(on_failure, surface="queue_write")
 	rq_retry = _build_rq_retry(retry_on, max_retries)
 
 	if not task_name:
@@ -146,7 +142,7 @@ def _execute_task(
 
 	try:
 		if isinstance(target_method, str):
-			target_method = frappe.get_attr(target_method)
+			target_method = frappe.get_attr(frappe.resolve_dotted_path(target_method, surface="queue_read"))
 
 		result = target_method(**kwargs)
 
@@ -230,19 +226,21 @@ def _current_rq_job():
 		return None
 
 
-def _callback_path(fn: Callable | str | None) -> str | None:
+def _callback_path(fn: Callable | str | None, *, surface: str) -> str | None:
 	if fn is None:
 		return None
-	if isinstance(fn, str):
-		return fn
-	return f"{fn.__module__}.{fn.__qualname__}"
+	return _resolve_job_callable(fn, surface=surface)[1]
 
 
 def _run_callback(callback: str | Callable, task_doc: "BackgroundTask", task_kwargs: dict, **outcome):
 	import inspect
 
 	try:
-		fn = frappe.get_attr(callback) if isinstance(callback, str) else callback
+		fn = (
+			frappe.get_attr(frappe.resolve_dotted_path(callback, surface="queue_read"))
+			if isinstance(callback, str)
+			else callback
+		)
 		context = {"task": task_doc, **outcome, **task_kwargs}
 		sig = inspect.signature(fn)
 		has_var_keyword = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())

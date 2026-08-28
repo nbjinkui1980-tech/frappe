@@ -1552,10 +1552,8 @@ def get_attr(method_string: str):
 	"""Get python method object from its name."""
 	import frappe
 
+	method_string = resolve_dotted_path(method_string, surface="method")
 	app_name = method_string.split(".", 1)[0]
-	if app_name == "erpnext" and "anydeals_erp" in frappe.get_installed_apps():
-		method_string = method_string.replace("erpnext", "anydeals_erp", 1)
-		app_name = "anydeals_erp"
 	if (
 		not frappe.local.flags.in_uninstall
 		and not frappe.local.flags.in_install

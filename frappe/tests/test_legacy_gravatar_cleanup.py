@@ -38,18 +38,19 @@ def skip_gravatar_deletion_prompt(value):
 
 
 class TestGravatarDeletion(IntegrationTestCase):
-	def test_current_erp_identities_add_the_lead_image_field(self):
-		for installed_apps, expected in (
-			(["frappe"], [("User", "user_image"), ("Contact", "image")]),
-			(["frappe", "erpnext"], [("User", "user_image"), ("Contact", "image"), ("Lead", "image")]),
-			(
-				["frappe", "anydeals_erp"],
+	def test_static_hook_adds_legacy_image_fields(self):
+		with patch.object(frappe, "get_hooks", return_value=[("Lead", "image")]):
+			self.assertEqual(
+				get_gravatar_image_fields(),
 				[("User", "user_image"), ("Contact", "image"), ("Lead", "image")],
-			),
-		):
-			with self.subTest(installed_apps=installed_apps):
-				with patch.object(frappe, "get_installed_apps", return_value=installed_apps):
-					self.assertEqual(get_gravatar_image_fields(), expected)
+			)
+
+	def test_legacy_image_field_hook_rejects_non_static_entries(self):
+		for item in ("app.method", lambda: None, ("Lead",), ("Lead", ""), ["Lead", "image"]):
+			with self.subTest(item=item):
+				with patch.object(frappe, "get_hooks", return_value=[item]):
+					with self.assertRaises(frappe.ValidationError):
+						get_gravatar_image_fields()
 
 	def test_delete_gravatar_image_urls(self):
 		user, contact, lead = self.create_gravatar_records()

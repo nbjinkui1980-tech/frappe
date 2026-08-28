@@ -53,7 +53,8 @@ class PatchType(Enum):
 
 def run_all(skip_failing: bool = False, patch_type: PatchType | None = None) -> None:
 	"""run all pending patches"""
-	executed = set(frappe.get_all("Patch Log", filters={"skipped": 0}, fields="patch", pluck="patch"))
+	executed_rows = set(frappe.get_all("Patch Log", filters={"skipped": 0}, fields="patch", pluck="patch"))
+	executed = {_canonical_patch_name(patch) for patch in executed_rows}
 
 	frappe.flags.final_patches = []
 
@@ -72,8 +73,12 @@ def run_all(skip_failing: bool = False, patch_type: PatchType | None = None) -> 
 	patches = get_all_patches(patch_type=patch_type)
 
 	for patch in patches:
-		if patch and (patch not in executed):
+		canonical_patch = _canonical_patch_name(patch) if patch else patch
+		if patch and canonical_patch not in executed:
 			run_patch(patch)
+		elif canonical_patch and canonical_patch not in executed_rows:
+			update_patch_log(canonical_patch)
+			executed_rows.add(canonical_patch)
 
 	# patches to be run in the end
 	for patch in frappe.flags.final_patches:
@@ -209,7 +214,7 @@ def execute_patch(patchmodule: str, method=None, methodargs=None):
 def update_patch_log(patchmodule, skipped=False):
 	"""update patch_file in patch log"""
 
-	patch = frappe.get_doc({"doctype": "Patch Log", "patch": patchmodule})
+	patch = frappe.get_doc({"doctype": "Patch Log", "patch": _canonical_patch_name(patchmodule)})
 
 	if skipped:
 		traceback = frappe.get_traceback(with_context=True)
@@ -222,10 +227,22 @@ def update_patch_log(patchmodule, skipped=False):
 
 def executed(patchmodule):
 	"""return True if is executed"""
+	patchmodule = _canonical_patch_name(patchmodule)
+	return any(
+		_canonical_patch_name(patch) == patchmodule
+		for patch in frappe.get_all("Patch Log", filters={"skipped": 0}, pluck="patch")
+	)
+
+
+def _canonical_patch_name(patchmodule: str) -> str:
 	if patchmodule.startswith("finally:"):
-		# patches are saved without the finally: tag
-		patchmodule = patchmodule.replace("finally:", "")
-	return frappe.db.get_value("Patch Log", {"patch": patchmodule, "skipped": 0})
+		patchmodule = patchmodule.removeprefix("finally:")
+	if patchmodule.startswith("execute:"):
+		return patchmodule
+
+	module, separator, suffix = patchmodule.partition(" ")
+	module = frappe.resolve_dotted_path(module, surface="patch_log")
+	return f"{module}{separator}{suffix}"
 
 
 def _patch_mode(enable):

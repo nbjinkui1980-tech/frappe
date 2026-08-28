@@ -8,6 +8,28 @@ from frappe.utils import get_site_url
 
 
 class TestClient(IntegrationTestCase):
+	def test_api_dispatch_resolves_the_command_before_lookup(self):
+		from frappe.handler import execute_cmd
+
+		method = object()
+		with (
+			patch.object(
+				frappe,
+				"resolve_dotted_path",
+				return_value="canonical_app.api.method",
+			) as resolve_dotted_path,
+			patch.object(frappe, "override_whitelisted_method", side_effect=lambda value: value),
+			patch("frappe.handler.get_server_script_map", return_value={}),
+			patch("frappe.handler.get_attr", return_value=method) as get_attr,
+			patch("frappe.handler.is_whitelisted"),
+			patch("frappe.handler.is_valid_http_method"),
+			patch.object(frappe, "call", return_value="ok"),
+		):
+			self.assertEqual(execute_cmd("legacy_app.api.method"), "ok")
+
+		resolve_dotted_path.assert_called_once_with("legacy_app.api.method", surface="api")
+		get_attr.assert_called_once_with("canonical_app.api.method")
+
 	def test_set_value(self):
 		todo = frappe.get_doc(doctype="ToDo", description="test").insert()
 		frappe.set_value("ToDo", todo.name, "description", "test 1")

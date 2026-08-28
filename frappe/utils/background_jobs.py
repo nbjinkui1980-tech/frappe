@@ -8,6 +8,7 @@ from collections import defaultdict
 from collections.abc import Callable
 from contextlib import suppress
 from functools import lru_cache
+from inspect import ismethod
 from threading import Thread
 from typing import Any, NoReturn
 from uuid import uuid4
@@ -50,6 +51,31 @@ QUEUE_STARVATION_THRESHOLD = 16
 _redis_queue_conn = None
 
 
+def _resolve_job_callable(method: str | Callable, *, surface: str) -> tuple[str | Callable, str]:
+	if isinstance(method, str):
+		method_name = frappe.resolve_dotted_path(method, surface=surface)
+		return method_name, method_name
+
+	try:
+		qualname = method.__qualname__
+		method_name = f"{method.__module__}.{qualname}"
+	except AttributeError:
+		raise TypeError("Queued callable must have a module and qualname") from None
+
+	method_name = frappe.resolve_dotted_path(method_name, surface=surface)
+	module_name = method_name[: -(len(qualname) + 1)]
+	resolved = frappe.get_module(module_name)
+	for attribute in qualname.split("."):
+		resolved = getattr(resolved, attribute)
+	if ismethod(method):
+		if resolved is not method.__func__:
+			raise ValueError(f"Queued callable {method_name!r} does not resolve to the supplied method")
+		return method, method_name
+	if resolved is not method:
+		raise ValueError(f"Queued callable {method_name!r} does not resolve to the supplied function")
+	return resolved, method_name
+
+
 @lru_cache
 def get_queues_timeout() -> dict[str, int]:
 	"""
@@ -86,8 +112,8 @@ def enqueue(
 	now: bool = False,
 	enqueue_after_commit: bool = False,
 	*,
-	on_success: Callable | None = None,
-	on_failure: Callable | None = None,
+	on_success: str | Callable | None = None,
+	on_failure: str | Callable | None = None,
 	at_front: bool = False,
 	job_id: str | None = None,
 	deduplicate=False,
@@ -119,6 +145,11 @@ def enqueue(
 	"""
 	# To handle older implementations
 	is_async = kwargs.pop("async", is_async)
+	method, method_name = _resolve_job_callable(method, surface="queue_write")
+	if on_success:
+		on_success, _ = _resolve_job_callable(on_success, surface="queue_write")
+	if on_failure:
+		on_failure, _ = _resolve_job_callable(on_failure, surface="queue_write")
 
 	if deduplicate:
 		if not job_id:
@@ -171,13 +202,6 @@ def enqueue(
 
 	if not timeout:
 		timeout = get_queues_timeout().get(queue) or 300
-
-	# Prepare a more readable name than <function $name at $address>
-	if isinstance(method, Callable):
-		method_name = f"{method.__module__}.{method.__qualname__}"
-	else:
-		method_name = method
-	assert method_name, "method_name must be a non-empty identifier for the queued job"
 
 	queue_args = {
 		"site": frappe.local.site,
@@ -258,8 +282,8 @@ def execute_job(site, method, event, job_name, kwargs, user=None, is_async=True,
 			frappe.set_user(user)
 
 	if isinstance(method, str):
-		method_name = method
-		method = frappe.get_attr(method)
+		method_name = frappe.resolve_dotted_path(method, surface="queue_read")
+		method = frappe.get_attr(method_name)
 	else:
 		method_name = f"{method.__module__}.{method.__qualname__}"
 

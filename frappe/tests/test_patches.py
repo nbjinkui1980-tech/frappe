@@ -49,15 +49,47 @@ app.module.patch4
 
 
 class TestPatches(IntegrationTestCase):
-	def test_legacy_and_canonical_patch_paths_are_currently_distinct(self):
+	def test_legacy_patch_log_marks_canonical_path_without_rerun(self):
 		with (
 			patch.object(frappe, "get_all", return_value=["erpnext.patches.example"]),
 			patch.object(patch_handler, "get_all_patches", return_value=["anydeals_erp.patches.example"]),
 			patch.object(patch_handler, "run_single", return_value=True) as run_single,
+			patch.object(patch_handler, "update_patch_log") as update_patch_log,
+			patch.object(
+				frappe,
+				"resolve_dotted_path",
+				side_effect=lambda path, *, surface: path.replace("erpnext.", "anydeals_erp.", 1),
+			),
 		):
 			patch_handler.run_all()
 
-		run_single.assert_called_once_with(patchmodule="anydeals_erp.patches.example")
+		run_single.assert_not_called()
+		update_patch_log.assert_called_once_with("anydeals_erp.patches.example")
+
+	def test_patch_log_writes_canonical_path(self):
+		with (
+			patch.object(
+				frappe,
+				"resolve_dotted_path",
+				return_value="canonical_app.patches.example",
+			),
+			patch.object(frappe, "get_doc") as get_doc,
+		):
+			patch_handler.update_patch_log("legacy_app.patches.example")
+
+		self.assertEqual(get_doc.call_args.args[0]["patch"], "canonical_app.patches.example")
+		get_doc.return_value.insert.assert_called_once_with(ignore_permissions=True)
+
+	def test_executed_compares_legacy_and_canonical_paths(self):
+		with (
+			patch.object(frappe, "get_all", return_value=["legacy_app.patches.example"]),
+			patch.object(
+				frappe,
+				"resolve_dotted_path",
+				side_effect=lambda path, *, surface: path.replace("legacy_app.", "canonical_app.", 1),
+			),
+		):
+			self.assertTrue(patch_handler.executed("canonical_app.patches.example"))
 
 	def test_patch_module_names(self):
 		frappe.flags.final_patches = []

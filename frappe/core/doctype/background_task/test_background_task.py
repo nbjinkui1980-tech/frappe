@@ -171,6 +171,24 @@ class IntegrationTestBackgroundTask(IntegrationTestCase):
 		self.assertIn("sample_task", doc.on_success_callback)
 		self.assertIn("failing_task", doc.on_failure_callback)
 
+	def test_legacy_paths_are_canonicalized_before_task_persistence(self):
+		with patch.object(
+			frappe,
+			"resolve_dotted_path",
+			side_effect=lambda path, *, surface: path.replace("legacy_app.", "canonical_app.", 1),
+		):
+			doc = enqueue_task(
+				"legacy_app.jobs.run",
+				on_success="legacy_app.jobs.success",
+				on_failure="legacy_app.jobs.failure",
+				enqueue_after_commit=False,
+			)
+
+		self.assertEqual(doc.method, "canonical_app.jobs.run")
+		self.assertEqual(doc.on_success_callback, "canonical_app.jobs.success")
+		self.assertEqual(doc.on_failure_callback, "canonical_app.jobs.failure")
+		self.assertEqual(self.mock_enqueue.call_args.kwargs["target_method"], "canonical_app.jobs.run")
+
 	def test_retry_passes_stored_callbacks(self):
 		from frappe.core.doctype.background_task.background_task import retry_task
 

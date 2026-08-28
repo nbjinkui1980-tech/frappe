@@ -93,10 +93,15 @@ class TestCurrentApplicationIdentity(UnitTestCase):
 		module = MagicMock(target=object())
 		with (
 			patch.object(frappe, "get_installed_apps", return_value=["frappe", "anydeals_erp"]),
+			patch(
+				"frappe.utils.resolve_dotted_path",
+				return_value="anydeals_erp.module.target",
+			) as resolve_dotted_path,
 			patch("frappe.utils.get_module", return_value=module) as get_module,
 		):
 			self.assertIs(get_attr("erpnext.module.target"), module.target)
 
+		resolve_dotted_path.assert_called_once_with("erpnext.module.target", surface="method")
 		get_module.assert_called_once_with("anydeals_erp.module")
 
 
@@ -330,7 +335,13 @@ class TestProviderContract(UnitTestCase):
 
 	def test_invalid_setup_completion_is_contract_error(self):
 		patches = self.provider_patches(setup_complete=2)
-		with patches[0], patches[1], patches[2], patches[3], self.assertRaises(ProviderContractError) as raised:
+		with (
+			patches[0],
+			patches[1],
+			patches[2],
+			patches[3],
+			self.assertRaises(ProviderContractError) as raised,
+		):
 			get_capability_provider("erp")
 		self.assertNotIsInstance(raised.exception, ProviderBindingError)
 
