@@ -394,6 +394,27 @@ class TestProviderSetupFinalizer(UnitTestCase):
 				handle_setup_exception.assert_called_once_with({})
 				self.assertEqual(frappe.response["setup_wizard_failure_message"], "Failed to complete setup")
 
+	def test_background_finalizer_failure_rolls_back_and_publishes_only_failure(self):
+		with (
+			patch.object(setup_wizard, "get_setup_provider", return_value=self.provider()),
+			patch.object(setup_wizard, "get_setup_wizard_completed_apps", return_value=[]),
+			patch.object(setup_wizard, "run_setup_success"),
+			patch.object(setup_wizard, "finalize_provider", side_effect=RuntimeError("finalizer")),
+			patch.object(frappe.db, "rollback") as rollback,
+			patch.object(setup_wizard, "clear_cache_after_maintenance"),
+			patch.object(frappe, "log_error"),
+			patch.object(frappe, "publish_realtime") as publish_realtime,
+			patch("frappe.utils.telemetry.capture"),
+		):
+			self.assertIsNone(setup_wizard.process_setup_stages([], {}, is_background_task=True))
+
+		rollback.assert_called_once_with()
+		publish_realtime.assert_called_once_with(
+			"setup_task",
+			{"status": "fail", "fail_msg": "Failed to complete setup"},
+			user=frappe.session.user,
+		)
+
 	def test_retry_after_committed_stage_reuses_authority_and_finalizes_once(self):
 		provider = self.provider()
 		authority = set()
