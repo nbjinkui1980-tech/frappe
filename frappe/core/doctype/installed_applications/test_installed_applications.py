@@ -328,6 +328,12 @@ class TestProviderContract(UnitTestCase):
 			reloaded=self.descriptor(aliases=()),
 		)
 
+	def test_invalid_setup_completion_is_contract_error(self):
+		patches = self.provider_patches(setup_complete=2)
+		with patches[0], patches[1], patches[2], patches[3], self.assertRaises(ProviderContractError) as raised:
+			get_capability_provider("erp")
+		self.assertNotIsInstance(raised.exception, ProviderBindingError)
+
 	def test_duplicate_provider_fails_closed(self):
 		descriptors = (self.descriptor("virtual_erp"), self.descriptor("second_erp"))
 		patches = self.provider_patches(descriptors=descriptors)
