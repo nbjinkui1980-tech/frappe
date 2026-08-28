@@ -1405,18 +1405,20 @@ def _get_provider_aliases(
 	apps = set(frappe.get_all_apps())
 	aliases: dict[str, str] = {}
 	for descriptor in descriptors if descriptors is not None else _get_provider_descriptors():
-		for alias in descriptor.legacy_aliases:
-			if alias.name in apps:
+		for legacy_alias in descriptor.legacy_aliases:
+			if legacy_alias.name in apps:
 				raise _provider_contract_error(
-					f"Provider alias {alias.name!r} conflicts with a real application"
+					f"Provider alias {legacy_alias.name!r} conflicts with a real application"
 				)
-			if alias.name in aliases:
-				raise _provider_contract_error(f"Provider alias {alias.name!r} is declared more than once")
-			aliases[alias.name] = descriptor.canonical_app
+			if legacy_alias.name in aliases:
+				raise _provider_contract_error(
+					f"Provider alias {legacy_alias.name!r} is declared more than once"
+				)
+			aliases[legacy_alias.name] = descriptor.canonical_app
 
-	for alias in aliases:
+	for alias_name in aliases:
 		seen = set()
-		name = alias
+		name = alias_name
 		while name in aliases:
 			if name in seen:
 				raise _provider_contract_error(f"Provider alias cycle includes {name!r}")
