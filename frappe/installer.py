@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from collections import OrderedDict
 from contextlib import suppress
 from shutil import which
@@ -782,6 +783,52 @@ def _sync_installed_apps_to_site_config():
 		update_site_config("installed_apps", frappe.get_installed_apps())
 	except Exception:
 		pass
+
+
+def sync_installed_apps_to_site_config_strict(installed_apps: list[str]) -> None:
+	"""Atomically mirror the canonical installed-apps list and verify the result."""
+	from frappe.config import clear_site_config_cache, get_site_config
+
+	if (
+		not isinstance(installed_apps, list)
+		or any(not isinstance(app, str) or not app for app in installed_apps)
+		or len(installed_apps) != len(set(installed_apps))
+	):
+		raise ValueError("installed_apps must be an ordered list of unique application names")
+
+	site_config_path = get_site_config_path()
+	temporary_path = None
+	with filelock("site_config"):
+		try:
+			with open(site_config_path) as config_file:
+				site_config = json.load(config_file)
+			if not isinstance(site_config, dict):
+				raise ValueError("site_config.json must contain a JSON object")
+
+			site_config["installed_apps"] = installed_apps
+			fd, temporary_path = tempfile.mkstemp(
+				dir=os.path.dirname(site_config_path), prefix=".site_config.", suffix=".tmp"
+			)
+			with os.fdopen(fd, "w") as temporary_file:
+				json.dump(site_config, temporary_file, indent=1, sort_keys=True)
+				temporary_file.flush()
+				os.fsync(temporary_file.fileno())
+			os.replace(temporary_path, site_config_path)
+			temporary_path = None
+
+			clear_site_config_cache()
+			readback = get_site_config(
+				sites_path=frappe.local.sites_path,
+				site_path=frappe.local.site_path,
+				cached=True,
+			).get("installed_apps")
+			if readback != installed_apps:
+				raise RuntimeError("installed_apps mirror readback mismatch")
+			frappe.local.conf.installed_apps = installed_apps
+		finally:
+			if temporary_path:
+				with suppress(OSError):
+					os.unlink(temporary_path)
 
 
 def update_site_config(key, value, validate=True, site_config_path=None):
