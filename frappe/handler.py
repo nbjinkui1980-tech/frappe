@@ -221,7 +221,7 @@ def upload_file():
 			frappe.throw(_("You can only upload JPG, PNG, GIF, PDF, TXT, CSV or Microsoft documents."))
 
 	if method:
-		method = frappe.get_attr(method)
+		method = frappe.get_attr(frappe.resolve_dotted_path(method, surface="api"))
 		is_whitelisted(method)
 		return method()
 	else:

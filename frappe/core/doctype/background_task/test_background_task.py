@@ -1,5 +1,5 @@
 import time
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 import frappe
 from frappe.core.doctype.doctype.test_doctype import new_doctype
@@ -193,13 +193,34 @@ class IntegrationTestBackgroundTask(IntegrationTestCase):
 		from frappe.core.doctype.background_task.background_task import retry_task
 
 		doc = enqueue_task(failing_task, on_success=sample_task, on_failure=sample_task)
-		doc.db_set("status", "Failed")
+		doc.db_set(
+			{
+				"status": "Failed",
+				"method": "legacy_app.jobs.run",
+				"on_success_callback": "legacy_app.jobs.success",
+				"on_failure_callback": "legacy_app.jobs.failure",
+			}
+		)
 
-		retry_task(doc.task_id)
+		with patch.object(
+			frappe,
+			"resolve_dotted_path",
+			side_effect=lambda path, *, surface: path.replace("legacy_app.", "canonical_app.", 1),
+		) as resolve_dotted_path:
+			retry_task(doc.task_id)
 
 		call_kwargs = self.mock_enqueue.call_args.kwargs
-		self.assertEqual(call_kwargs["task_on_success"], doc.on_success_callback)
-		self.assertEqual(call_kwargs["task_on_failure"], doc.on_failure_callback)
+		self.assertEqual(call_kwargs["target_method"], "canonical_app.jobs.run")
+		self.assertEqual(call_kwargs["task_on_success"], "canonical_app.jobs.success")
+		self.assertEqual(call_kwargs["task_on_failure"], "canonical_app.jobs.failure")
+		self.assertEqual(
+			resolve_dotted_path.call_args_list,
+			[
+				call("legacy_app.jobs.run", surface="queue_write"),
+				call("legacy_app.jobs.success", surface="queue_write"),
+				call("legacy_app.jobs.failure", surface="queue_write"),
+			],
+		)
 
 	def test_retriable_exception_keeps_status_running(self):
 		doc = enqueue_task(failing_task, retry_on=(ValueError,), max_retries=3)

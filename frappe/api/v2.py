@@ -51,6 +51,8 @@ def handle_rpc_call(method: str, doctype: str | None = None):
 		module = load_doctype_module(doctype)
 		method = module.__name__ + "." + method
 
+	if "." in method:
+		method = frappe.resolve_dotted_path(method, surface="api")
 	method = frappe.override_whitelisted_method(method)
 
 	# via server script

@@ -3,7 +3,7 @@
 
 from dataclasses import FrozenInstanceError
 from types import ModuleType
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import frappe
 from frappe.core.doctype.installed_applications.installed_applications import (
@@ -236,10 +236,20 @@ class TestProviderContract(UnitTestCase):
 				"virtual_erp.module.method",
 			)
 			self.assertEqual(
+				resolve_dotted_path("legacy_erp.module.method", surface="method"),
+				"virtual_erp.module.method",
+			)
+			self.assertEqual(
 				resolve_dotted_path("myerpnext.module.method", surface="method"),
 				"myerpnext.module.method",
 			)
-			record_usage.assert_called_once_with("legacy_erp", "virtual_erp", AliasSurface.METHOD, __name__)
+			record_usage.assert_has_calls(
+				[
+					call("legacy_erp", "virtual_erp", AliasSurface.METHOD, __name__),
+					call("legacy_erp", "virtual_erp", AliasSurface.METHOD, __name__),
+				]
+			)
+			self.assertEqual(record_usage.call_count, 2)
 
 		resolve_app_name.clear_cache()
 		with (

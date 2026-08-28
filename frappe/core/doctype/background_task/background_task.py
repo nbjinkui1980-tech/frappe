@@ -225,6 +225,13 @@ def retry_task(task_id: str):
 	if task.status not in ("Failed", "Cancelled"):
 		raise frappe.InvalidStatusError(frappe._("Task can only be retried if failed or cancelled"))
 
+	from frappe.utils.background_jobs import _resolve_job_callable
+	from frappe.utils.task_queue import _callback_path, _execute_task
+
+	target_method = _resolve_job_callable(task.method, surface="queue_write")[1]
+	on_success = _callback_path(task.on_success_callback, surface="queue_write")
+	on_failure = _callback_path(task.on_failure_callback, surface="queue_write")
+
 	task.db_set(
 		{
 			"status": "Queued",
@@ -240,8 +247,6 @@ def retry_task(task_id: str):
 
 	import json
 
-	from frappe.utils.task_queue import _execute_task
-
 	arguments = json.loads(task.arguments) if task.arguments else {}
 
 	frappe.enqueue(
@@ -250,10 +255,10 @@ def retry_task(task_id: str):
 		job_id=task.job_id or task.task_id,
 		at_front=False,
 		task_id=task.task_id,
-		target_method=task.method,
+		target_method=target_method,
 		task_user=task.user,
-		task_on_success=task.on_success_callback,
-		task_on_failure=task.on_failure_callback,
+		task_on_success=on_success,
+		task_on_failure=on_failure,
 		**arguments,
 	)
 

@@ -1,6 +1,6 @@
 # Copyright (c) 2015, Frappe Technologies Pvt. Ltd. and Contributors
 
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import frappe
 from frappe.tests import IntegrationTestCase
@@ -29,6 +29,53 @@ class TestClient(IntegrationTestCase):
 
 		resolve_dotted_path.assert_called_once_with("legacy_app.api.method", surface="api")
 		get_attr.assert_called_once_with("canonical_app.api.method")
+
+	def test_api_v2_dispatch_resolves_the_command_as_api(self):
+		from frappe.api.v2 import handle_rpc_call
+
+		method = object()
+		with (
+			patch.object(
+				frappe,
+				"resolve_dotted_path",
+				return_value="canonical_app.api.method",
+			) as resolve_dotted_path,
+			patch.object(frappe, "override_whitelisted_method", side_effect=lambda value: value),
+			patch("frappe.api.v2.get_server_script_map", return_value={}),
+			patch.object(frappe, "get_attr", return_value=method) as get_attr,
+			patch("frappe.api.v2.is_whitelisted"),
+			patch("frappe.api.v2.is_valid_http_method"),
+			patch.object(frappe, "call", return_value="ok"),
+		):
+			self.assertEqual(handle_rpc_call("legacy_app.api.method"), "ok")
+
+		resolve_dotted_path.assert_called_once_with("legacy_app.api.method", surface="api")
+		get_attr.assert_called_once_with("canonical_app.api.method")
+
+	def test_upload_callback_resolves_the_command_as_api(self):
+		from frappe.handler import upload_file
+
+		method = MagicMock(return_value="ok")
+		with (
+			patch.object(frappe.local, "request", frappe._dict(files={})),
+			patch.object(
+				frappe.local,
+				"form_dict",
+				frappe._dict(method="legacy_app.api.upload", is_private=1, folder="Home"),
+			),
+			patch("frappe.handler.check_write_permission"),
+			patch.object(
+				frappe,
+				"resolve_dotted_path",
+				return_value="canonical_app.api.upload",
+			) as resolve_dotted_path,
+			patch.object(frappe, "get_attr", return_value=method) as get_attr,
+			patch("frappe.handler.is_whitelisted"),
+		):
+			self.assertEqual(upload_file(), "ok")
+
+		resolve_dotted_path.assert_called_once_with("legacy_app.api.upload", surface="api")
+		get_attr.assert_called_once_with("canonical_app.api.upload")
 
 	def test_set_value(self):
 		todo = frappe.get_doc(doctype="ToDo", description="test").insert()

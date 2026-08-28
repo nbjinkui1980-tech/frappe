@@ -1447,11 +1447,7 @@ def resolve_app_name(name: str) -> str:
 
 
 @site_cache
-def resolve_dotted_path(path: str, *, surface: str) -> str:
-	try:
-		surface = AliasSurface(surface)
-	except (TypeError, ValueError):
-		raise _provider_contract_error(f"Invalid dotted path surface {surface!r}") from None
+def _resolve_dotted_path(path: str, *, surface: AliasSurface) -> str:
 	if (
 		not isinstance(path, str)
 		or "." not in path
@@ -1461,13 +1457,25 @@ def resolve_dotted_path(path: str, *, surface: str) -> str:
 
 	app_name, remainder = path.split(".", 1)
 	canonical_app = resolve_app_name(app_name)
-	if canonical_app != app_name:
-		frame = sys._getframe(1)
-		while frame and frame.f_globals.get("__name__") == "frappe.utils.caching":
-			frame = frame.f_back
-		caller = frame.f_globals.get("__name__", "") if frame else ""
-		record_app_alias_usage(app_name, canonical_app, surface, caller)
 	return f"{canonical_app}.{remainder}"
+
+
+def resolve_dotted_path(path: str, *, surface: str) -> str:
+	try:
+		surface = AliasSurface(surface)
+	except (TypeError, ValueError):
+		raise _provider_contract_error(f"Invalid dotted path surface {surface!r}") from None
+
+	resolved_path = _resolve_dotted_path(path, surface=surface)
+	app_name = path.split(".", 1)[0]
+	canonical_app = resolved_path.split(".", 1)[0]
+	if canonical_app != app_name:
+		caller = sys._getframe(1).f_globals.get("__name__", "")
+		record_app_alias_usage(app_name, canonical_app, surface, caller)
+	return resolved_path
+
+
+resolve_dotted_path.clear_cache = _resolve_dotted_path.clear_cache
 
 
 def record_app_alias_usage(alias: str, canonical_app: str, surface: AliasSurface, caller: str) -> None:
