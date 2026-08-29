@@ -7,7 +7,7 @@ from MySQLdb.constants import ER, FIELD_TYPE
 from MySQLdb.converters import conversions
 
 import frappe
-from frappe.database.database import Database
+from frappe.database.database import Database, DatabaseCapability, UnsupportedDatabaseCapabilityError
 from frappe.database.mariadb.schema import MariaDBTable
 from frappe.utils import get_datetime, get_table_name, get_timezone_utc_offset
 
@@ -199,6 +199,7 @@ def escape_dict(obj, mapping=None):
 
 
 class MariaDBDatabase(MariaDBConnectionUtil, MariaDBExceptionUtil, Database):
+	capabilities = frozenset({DatabaseCapability.SESSION_ADVISORY_LOCK})
 	REGEX_CHARACTER = "regexp"
 	CONVERSION_MAP = conversions | {
 		FIELD_TYPE.NEWDECIMAL: float,
@@ -454,12 +455,15 @@ class MariaDBDatabase(MariaDBConnectionUtil, MariaDBExceptionUtil, Database):
 	def add_index(
 		self, doctype: str, fields: list, index_name: str | None = None, using=None, where=None, include=None
 	):
-		"""Creates an index with given fields if not already created.
-		`using`/`where`/`include` are postgres-only (trigram/partial/covering) with no MariaDB
-		equivalent, so they are silently ignored: a `using` kind skips index creation, and
-		`where`/`include` fall back to a plain index over `fields`."""
+		"""Creates an index with given fields if not already created."""
 		from frappe.custom.doctype.property_setter.property_setter import make_property_setter
 
+		if where:
+			raise UnsupportedDatabaseCapabilityError(DatabaseCapability.PARTIAL_INDEX, self.db_type)
+		if include:
+			raise UnsupportedDatabaseCapabilityError(DatabaseCapability.COVERING_INDEX, self.db_type)
+		if using == "gin_trgm":
+			raise UnsupportedDatabaseCapabilityError(DatabaseCapability.TRIGRAM_INDEX, self.db_type)
 		if using:
 			return
 		index_name = index_name or self.get_index_name(fields)

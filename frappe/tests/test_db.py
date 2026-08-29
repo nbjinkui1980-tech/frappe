@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 import frappe
 from frappe.core.utils import find
 from frappe.custom.doctype.custom_field.custom_field import create_custom_field
-from frappe.database import get_db, savepoint
+from frappe.database import DatabaseCapability, UnsupportedDatabaseCapabilityError, get_db, savepoint
 from frappe.database.database import get_query_execution_timeout
 from frappe.database.utils import FallBackDateTimeStr
 from frappe.query_builder import Field
@@ -23,6 +23,63 @@ from frappe.utils.testutils import clear_custom_fields
 
 
 class TestDB(IntegrationTestCase):
+	def test_database_capabilities(self):
+		from frappe.database.mariadb.database import MariaDBDatabase
+		from frappe.database.mariadb.mysqlclient import MariaDBDatabase as MariaDBDatabaseMySQLClient
+		from frappe.database.postgres.database import PostgresDatabase
+		from frappe.database.sqlite.database import SQLiteDatabase
+
+		mariadb = frozenset({DatabaseCapability.SESSION_ADVISORY_LOCK})
+		postgres = frozenset(
+			{
+				DatabaseCapability.SESSION_ADVISORY_LOCK,
+				DatabaseCapability.TRANSACTION_ADVISORY_LOCK,
+				DatabaseCapability.PARTIAL_INDEX,
+				DatabaseCapability.COVERING_INDEX,
+				DatabaseCapability.TRIGRAM_INDEX,
+			}
+		)
+		self.assertEqual(frozenset(DatabaseCapability), postgres)
+		self.assertEqual(MariaDBDatabase.capabilities, mariadb)
+		self.assertEqual(MariaDBDatabaseMySQLClient.capabilities, mariadb)
+		self.assertEqual(PostgresDatabase.capabilities, postgres)
+		self.assertEqual(SQLiteDatabase.capabilities, frozenset())
+
+		for capability in DatabaseCapability:
+			self.assertEqual(frappe.db.supports(capability), capability in frappe.db.capabilities)
+		with self.assertRaises(TypeError):
+			frappe.db.supports(DatabaseCapability.SESSION_ADVISORY_LOCK.value)
+
+	def test_unsupported_database_capability_error(self):
+		from frappe.database.mariadb.database import MariaDBDatabase
+		from frappe.database.mariadb.mysqlclient import MariaDBDatabase as MariaDBDatabaseMySQLClient
+		from frappe.database.sqlite.database import SQLiteDatabase
+
+		for db in (MariaDBDatabase(), MariaDBDatabaseMySQLClient()):
+			with self.assertRaises(UnsupportedDatabaseCapabilityError) as cm:
+				db.transaction_advisory_lock("unsupported")
+			self.assertEqual(cm.exception.capability, DatabaseCapability.TRANSACTION_ADVISORY_LOCK)
+			self.assertEqual(cm.exception.db_type, "mariadb")
+			for kwargs, capability in (
+				({"where": "name IS NOT NULL"}, DatabaseCapability.PARTIAL_INDEX),
+				({"include": ["modified"]}, DatabaseCapability.COVERING_INDEX),
+				({"using": "gin_trgm"}, DatabaseCapability.TRIGRAM_INDEX),
+			):
+				with self.assertRaises(UnsupportedDatabaseCapabilityError) as cm:
+					db.add_index("User", ["name"], **kwargs)
+				self.assertEqual(cm.exception.capability, capability)
+				self.assertEqual(cm.exception.db_type, "mariadb")
+
+		db = SQLiteDatabase(cur_db_name=":memory:")
+		for method, capability in (
+			(db.advisory_lock, DatabaseCapability.SESSION_ADVISORY_LOCK),
+			(db.transaction_advisory_lock, DatabaseCapability.TRANSACTION_ADVISORY_LOCK),
+		):
+			with self.assertRaises(UnsupportedDatabaseCapabilityError) as cm:
+				method("unsupported")
+			self.assertEqual(cm.exception.capability, capability)
+			self.assertEqual(cm.exception.db_type, "sqlite")
+
 	def test_datetime_format(self):
 		now_str = now()
 		self.assertEqual(frappe.db.format_datetime(None), FallBackDateTimeStr)
@@ -1881,6 +1938,23 @@ class TestDbConnectWithEnvCredentials(IntegrationTestCase):
 
 
 class TestMariaDBExceptionUtil(IntegrationTestCase):
+	def test_deadlock_errors_are_retriable(self):
+		import MySQLdb
+		import pymysql
+		from MySQLdb.constants import ER as mysqlclient_er
+		from pymysql.constants import ER as pymysql_er
+
+		from frappe.database.mariadb.database import MariaDBExceptionUtil
+		from frappe.database.mariadb.mysqlclient import MariaDBExceptionUtil as MySQLClientExceptionUtil
+
+		for exception, error_codes, exception_util in (
+			(pymysql.OperationalError, pymysql_er, MariaDBExceptionUtil),
+			(MySQLdb.OperationalError, mysqlclient_er, MySQLClientExceptionUtil),
+		):
+			for error_code in (error_codes.LOCK_DEADLOCK, error_codes.CHECKREAD):
+				self.assertTrue(exception_util.is_deadlocked(exception(error_code, "retry")))
+			self.assertFalse(exception_util.is_deadlocked(exception(error_codes.PARSE_ERROR, "syntax")))
+
 	@run_only_if(db_type_is.MARIADB)
 	def test_exception_utils_handle_empty_args(self):
 		"""Exception utility methods should not raise IndexError when e.args is empty."""
@@ -1905,7 +1979,6 @@ class TestMariaDBExceptionUtil(IntegrationTestCase):
 		self.assertFalse(MariaDBExceptionUtil.is_data_too_long(e))
 		self.assertFalse(MariaDBExceptionUtil.is_db_table_size_limit(e))
 
-	@run_only_if(db_type_is.POSTGRES)
 	def test_serialization_failure_is_treated_as_deadlock(self):
 		"""Postgres serialization failures (REPEATABLE READ write conflicts) must be retriable like
 		deadlocks; otherwise they surface as unhandled query errors (e.g. on the per-request session

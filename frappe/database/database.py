@@ -10,6 +10,7 @@ import traceback
 import warnings
 from collections.abc import Iterable, Sequence
 from contextlib import contextmanager, suppress
+from enum import StrEnum
 from time import time
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -86,6 +87,21 @@ be ignored. Commit/Rollback from here WILL CAUSE very hard to debug problems wit
 concurrent data update bugs."""
 
 
+class DatabaseCapability(StrEnum):
+	SESSION_ADVISORY_LOCK = "session_advisory_lock"
+	TRANSACTION_ADVISORY_LOCK = "transaction_advisory_lock"
+	PARTIAL_INDEX = "partial_index"
+	COVERING_INDEX = "covering_index"
+	TRIGRAM_INDEX = "trigram_index"
+
+
+class UnsupportedDatabaseCapabilityError(NotImplementedError):
+	def __init__(self, capability: DatabaseCapability, db_type: str):
+		self.capability = capability
+		self.db_type = db_type
+		super().__init__(f"{db_type} does not support database capability {capability.value}")
+
+
 class Database:
 	"""
 	Open a database connection with the given parmeters, if use_default is True, use the
@@ -102,6 +118,7 @@ class Database:
 	DEFAULT_COLUMNS = ("name", "creation", "modified", "modified_by", "owner", "docstatus", "idx")
 	CHILD_TABLE_COLUMNS = ("parent", "parenttype", "parentfield")
 	MAX_WRITES_PER_TRANSACTION = 200_000
+	capabilities: frozenset[DatabaseCapability] = frozenset()
 
 	class InvalidColumnName(frappe.ValidationError):
 		pass
@@ -145,6 +162,11 @@ class Database:
 
 	def setup_type_map(self):
 		pass
+
+	def supports(self, capability: DatabaseCapability) -> bool:
+		if not isinstance(capability, DatabaseCapability):
+			raise TypeError("capability must be a DatabaseCapability")
+		return capability in self.capabilities
 
 	def connect(self):
 		"""Connects to a database as set in `site_config.json`."""
@@ -1550,13 +1572,13 @@ class Database:
 	def advisory_lock(self, key, *, timeout=10):
 		"""Hold a session-level advisory lock for the duration of the `with` block. Postgres uses
 		pg_advisory_lock, MariaDB uses GET_LOCK; engines without advisory locks raise."""
-		raise NotImplementedError(f"Advisory locks are not supported on {self.db_type}.")
+		raise UnsupportedDatabaseCapabilityError(DatabaseCapability.SESSION_ADVISORY_LOCK, self.db_type)
 
 	def transaction_advisory_lock(self, key, *, timeout=10):
 		"""Take an advisory lock released automatically when the current transaction ends.
 		Postgres only (pg_advisory_xact_lock); other engines have no transaction-scoped
 		advisory locks and raise."""
-		raise NotImplementedError(f"Transaction-scoped advisory locks are not supported on {self.db_type}.")
+		raise UnsupportedDatabaseCapabilityError(DatabaseCapability.TRANSACTION_ADVISORY_LOCK, self.db_type)
 
 	def create_sequence_table(self):
 		# MariaDB/Postgres have native sequences and need no backing table;

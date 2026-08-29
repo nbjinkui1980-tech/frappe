@@ -7,7 +7,7 @@ from pathlib import Path
 from shutil import which
 from urllib.parse import quote
 
-from frappe.database.database import savepoint
+from frappe.database.database import DatabaseCapability, UnsupportedDatabaseCapabilityError, savepoint
 
 
 def setup_database(force, verbose=None, mariadb_user_host_login_scope=None):

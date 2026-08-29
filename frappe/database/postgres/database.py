@@ -29,7 +29,7 @@ from psycopg2.errors import (
 from psycopg2.extensions import ISOLATION_LEVEL_REPEATABLE_READ
 
 import frappe
-from frappe.database.database import CREATE_OR_DROP, Database
+from frappe.database.database import CREATE_OR_DROP, Database, DatabaseCapability
 from frappe.database.postgres.schema import PostgresTable
 from frappe.database.utils import EmptyQueryValues, LazyDecode
 from frappe.utils import cstr, get_table_name
@@ -211,6 +211,15 @@ class PostgresExceptionUtil:
 
 
 class PostgresDatabase(PostgresExceptionUtil, Database):
+	capabilities = frozenset(
+		{
+			DatabaseCapability.SESSION_ADVISORY_LOCK,
+			DatabaseCapability.TRANSACTION_ADVISORY_LOCK,
+			DatabaseCapability.PARTIAL_INDEX,
+			DatabaseCapability.COVERING_INDEX,
+			DatabaseCapability.TRIGRAM_INDEX,
+		}
+	)
 	REGEX_CHARACTER = "~"
 	default_port = "5432"
 
