@@ -1864,6 +1864,17 @@ class TestDbConnectWithEnvCredentials(IntegrationTestCase):
 		frappe.init(self.current_site, force=True)
 		frappe.connect()
 
+	def test_explicit_socket_takes_priority_over_tcp_env(self) -> None:
+		import os
+		from unittest.mock import patch
+
+		with patch.dict(
+			os.environ,
+			{"FRAPPE_DB_SOCKET": "/tmp/frappe-test.sock", "FRAPPE_DB_HOST": "iqx.local"},
+		):
+			frappe.init(self.current_site, force=True)
+			self.assertEqual(frappe.conf.db_socket, "/tmp/frappe-test.sock")
+
 	def test_connect_fails_with_wrong_credentials_by_env(self) -> None:
 		import contextlib
 		import os
