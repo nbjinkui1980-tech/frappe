@@ -1,7 +1,7 @@
 # Copyright (c) 2026, Frappe Technologies and Contributors
 # See license.txt
 
-# import frappe
+from frappe.database import delete_duckdb_file, get_duckdb
 from frappe.tests import IntegrationTestCase
 
 # On IntegrationTestCase, the doctype test records and all
@@ -17,4 +17,15 @@ class IntegrationTestDuckDBSync(IntegrationTestCase):
 	Use this class for testing interactions between multiple components.
 	"""
 
-	pass
+	def test_analytical_read(self):
+		filename = "test_duckdb_analytical_read.duckdb"
+		self.addCleanup(delete_duckdb_file, filename)
+		connection = get_duckdb(False, filename)
+		self.addCleanup(connection.close)
+
+		result = connection.sql(
+			"""select category, sum(amount) from (values ('books', 10), ('books', 15), ('music', 20))
+			as sales(category, amount) group by category order by category"""
+		).fetchall()
+
+		self.assertEqual(result, [("books", 25), ("music", 20)])
