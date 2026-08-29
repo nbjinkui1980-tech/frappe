@@ -16,6 +16,68 @@ permissions:
   contents: read
 
 jobs:
+  database-contract-mariadb:
+    name: Frappe Database Contract (MariaDB)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      DB_ROOT_PASSWORD: db_root
+    services:
+      mariadb:
+        image: mariadb:11.8
+        ports:
+          - 3306:3306
+        options: --health-cmd="healthcheck.sh --connect --innodb_initialized" --health-interval=5s --health-timeout=2s --health-retries=3 --tmpfs=/var/lib/mysql:rw,noexec,nosuid,size=2g
+        env:
+          MARIADB_ROOT_PASSWORD: ${{ env.DB_ROOT_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+        name: Environment Setup
+        with:
+          python-version: '3.14'
+          node-version: 24
+          build-assets: false
+          disable-web: true
+          disable-socketio: true
+          db-root-password: ${{ env.DB_ROOT_PASSWORD }}
+          db: mariadb
+      - name: Run Database Contract
+        run: bench --site test_site run-tests --app frappe --module frappe.tests.database_contract
+
+  database-contract-postgres:
+    name: Frappe Database Contract (PostgreSQL)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      DB_ROOT_PASSWORD: db_root
+    services:
+      postgres:
+        image: postgres:18.0
+        ports:
+          - 5432:5432
+        env:
+          POSTGRES_PASSWORD: travis
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 3
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+        name: Environment Setup
+        with:
+          python-version: '3.14'
+          node-version: 24
+          build-assets: false
+          disable-web: true
+          disable-socketio: true
+          db-root-password: ${{ env.DB_ROOT_PASSWORD }}
+          db: postgres
+      - name: Run Database Contract
+        run: bench --site test_site run-tests --app frappe --module frappe.tests.database_contract
+
   checkrun:
     name: Plan Tests
     runs-on: ubuntu-latest

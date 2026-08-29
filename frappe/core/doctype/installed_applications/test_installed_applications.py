@@ -287,7 +287,7 @@ class TestProviderContract(UnitTestCase):
 			patch.object(frappe.local, "site", "test.local"),
 			patch.object(frappe, "get_installed_apps", return_value=["virtual_erp"]),
 			patch("frappe.utils.importlib.import_module", return_value=hooks),
-			patch.object(frappe, "get_attr", return_value=sink),
+			patch.object(frappe, "get_attr", return_value=sink, create=True),
 			patch.object(frappe, "logger", return_value=logger),
 		):
 			self.assertIsNone(
