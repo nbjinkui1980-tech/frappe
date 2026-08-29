@@ -110,3 +110,38 @@ jobs:
           python-version: '3.14'
           cache: pip
       - uses: pre-commit/action@v3.0.1
+
+  ddl-boundary:
+    name: 'DDL Boundary'
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+
+      - name: Run unit tests
+        run: python .github/helper/test_ddl_boundary.py
+
+      - name: Check changed Python files
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          changed_python=()
+          while IFS= read -r file; do
+            changed_python+=("$file")
+          done < <(git diff --name-only --diff-filter=ACMR "$BASE_SHA" "$HEAD_SHA" -- 'frappe/*.py')
+          selected=("${changed_python[@]}")
+          echo "selected-count=${#selected[@]}"
+          if (( ${#changed_python[@]} > 0 && ${#selected[@]} == 0 )); then
+            echo "DDL boundary selection unexpectedly empty" >&2
+            exit 1
+          fi
+          if (( ${#selected[@]} > 0 )); then
+            .github/helper/ddl_boundary.py "${selected[@]}"
+          fi

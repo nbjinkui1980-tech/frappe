@@ -77,6 +77,14 @@ repos:
         stages: [commit-msg]
         additional_dependencies: ['conventional-changelog-conventionalcommits']
 
+  - repo: local
+    hooks:
+      - id: ddl-boundary
+        name: "DDL boundary"
+        entry: .github/helper/ddl_boundary.py
+        language: script
+        files: ^frappe/.*\.py$
+
 ci:
     autoupdate_schedule: weekly
     skip: []
