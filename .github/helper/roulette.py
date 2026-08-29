@@ -152,6 +152,16 @@ def matches_postgres_filenames(files_list):
 	return any(any(word in f.lower() for word in db_keywords) for f in files_list)
 
 
+def requires_postgres_full(files_list):
+	"""Return whether changed files require the full PostgreSQL suite."""
+	postgres_paths = ("frappe/database/", "frappe/query_builder/", "frappe/model/", "frappe/custom/")
+	return any(
+		(file.startswith(".github/") and file.endswith((".yml", ".yaml", ".py")))
+		or file.startswith(postgres_paths)
+		for file in files_list
+	)
+
+
 def is_docs(file):
 	"""Check if the file is documentation or image."""
 	regex = re.compile(r"\.(md|png|jpg|jpeg|csv|svg)$|^.github|LICENSE")
@@ -167,6 +177,10 @@ if __name__ == "__main__":
 	# If it's a push build, run all builds
 	if not pr_number:
 		os.system('echo "build=strawberry" >> $GITHUB_OUTPUT')
+		run_postgres = (
+			os.environ.get("GITHUB_EVENT_NAME") == "schedule" or os.environ.get("RELEASE_CANDIDATE") == "true"
+		)
+		os.system(f'echo "run_postgres={"true" if run_postgres else "false"}" >> $GITHUB_OUTPUT')
 		sys.exit(0)
 
 	# Get list of changed files if not provided
@@ -182,7 +196,7 @@ if __name__ == "__main__":
 	only_frontend_code_changed = len(list(filter(is_frontend_code, files_list))) == len(files_list)
 	updated_py_file_count = len(list(filter(is_server_side_code, files_list)))
 	only_py_changed = updated_py_file_count == len(files_list)
-	run_postgres = has_label(pr_number, "postgres", repo)
+	run_postgres = has_label(pr_number, "postgres", repo) or requires_postgres_full(files_list)
 
 	# Check for Skip CI label and other conditions
 	if has_skip_ci_label(pr_number, repo):
