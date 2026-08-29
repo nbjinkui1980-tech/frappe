@@ -37,6 +37,12 @@ def other():
 		violations = self.check('frappe.db.sql(f"""\nALTER TABLE `tab{x}`\nDROP COLUMN y\n""")')
 		self.assertEqual(len(violations), 1)
 
+	def test_rejects_ddl_after_leading_sql_comments(self):
+		for prefix in ("-- reason\n", "/* reason */", "\n-- reason\n/* detail */\n"):
+			with self.subTest(prefix=prefix):
+				self.assertEqual(len(self.check(f'frappe.db.sql("""{prefix}DROP TABLE tabX""")')), 1)
+		self.assertFalse(self.check('frappe.db.sql("""-- DROP TABLE tabX\nSELECT 1""")'))
+
 	def test_allows_dynamic_sql_and_non_ddl(self):
 		self.assertFalse(self.check("frappe.db.sql(query)"))
 		self.assertFalse(self.check('frappe.db.sql("SELECT name FROM tabUser")'))

@@ -7,7 +7,10 @@ import ast
 import re
 import sys
 
-DDL = re.compile(r"^\s*(?:alter|create|drop|truncate|rename)\b", re.I)
+DDL = re.compile(
+	r"\A(?:\s|--[^\r\n]*(?:\r?\n|\Z)|/\*.*?\*/)*(?:alter|create|drop|truncate|rename)\b",
+	re.I | re.S,
+)
 
 ALLOWED_PREFIXES = ("frappe/database/", "frappe/patches/", "frappe/tests/")
 ALLOWED_FILES = {
