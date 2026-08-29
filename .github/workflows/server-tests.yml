@@ -3,6 +3,12 @@ name: Server
 on:
   pull_request:
   workflow_dispatch:
+    inputs:
+      release_candidate:
+        description: Run the MariaDB and PostgreSQL release-candidate matrix
+        required: false
+        default: false
+        type: boolean
   schedule:
     # Run everday at midnight UTC / 5:30 IST
     - cron: "0 0 * * *"
@@ -34,6 +40,7 @@ jobs:
           PR_NUMBER: ${{ github.event.number }}
           REPO_NAME: ${{ github.repository }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_CANDIDATE: ${{ inputs.release_candidate }}
 
   test:
     name: Integration
