@@ -22,7 +22,7 @@ from frappe.core.doctype.server_script.server_script_utils import run_server_scr
 from frappe.database.utils import commit_after_response
 from frappe.desk.form.document_follow import _follow_document
 from frappe.integrations.doctype.webhook import run_webhooks
-from frappe.model import optional_fields, table_fields
+from frappe.model import CORE_DOCTYPES, optional_fields, table_fields
 from frappe.model.base_document import BaseDocument, D, get_controller
 from frappe.model.docstatus import DocStatus
 from frappe.model.naming import set_new_name, validate_name
@@ -30,6 +30,7 @@ from frappe.model.utils import is_virtual_doctype, simple_singledispatch
 from frappe.model.workflow import set_workflow_state_on_action, validate_workflow
 from frappe.types import DF
 from frappe.types.filter import FilterSignature
+from frappe.types.typed_semantics import normalize_typed_row, typed_semantics_v2_enabled
 from frappe.utils import cint, compare, cstr, date_diff, file_lock, flt, get_table_name, now
 from frappe.utils.data import get_absolute_url, get_datetime, get_timedelta, getdate
 from frappe.utils.global_search import update_global_search
@@ -548,6 +549,11 @@ class Document(BaseDocument):
 					frappe.DoesNotExistError(doctype=self.doctype),
 				)
 
+			if typed_semantics_v2_enabled() and self.doctype not in CORE_DOCTYPES:
+				# Meta bootstraps itself as a "DocType" document; reading self.meta before
+				# its cache entry is written recurses into get_meta indefinitely.
+				normalize_typed_row(d, self.meta)
+
 			super().__init__(d)
 		self.flags.pop("ignore_children", None)
 
@@ -590,6 +596,7 @@ class Document(BaseDocument):
 
 	def load_children_from_db(self):
 		is_doctype = self.doctype == "DocType"
+		typed_v2 = typed_semantics_v2_enabled()
 
 		for fieldname, child_doctype in self._table_fieldnames.items():
 			# Make sure not to query the DB for a child table, if it is a virtual one.
@@ -614,6 +621,13 @@ class Document(BaseDocument):
 
 			if children is None:
 				children = []
+
+			if children and typed_v2 and not is_doctype:
+				# DocType children load through the ORM during bootstrap, where meta for
+				# core doctypes is unavailable; those rows stay low-level by design.
+				child_meta = frappe.get_meta(child_doctype)
+				for row in children:
+					normalize_typed_row(row, child_meta)
 
 			self.set(fieldname, children)
 

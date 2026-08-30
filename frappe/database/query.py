@@ -25,6 +25,7 @@ from frappe.model.base_document import DOCTYPES_FOR_DOCTYPE
 from frappe.model.document import Document
 from frappe.query_builder import Criterion, Field, Order, functions
 from frappe.query_builder.custom import Month, MonthName, Quarter, Year
+from frappe.types.typed_semantics import typed_semantics_v2_enabled
 
 CORE_DOCTYPES = DOCTYPES_FOR_DOCTYPE | frozenset(
 	(
@@ -357,8 +358,53 @@ class Engine:
 			self.query._parent_doctype = self.parent_doctype
 			self.query._fields_list = getattr(self, "fields", [])
 
+		if (
+			is_select
+			and self.doctype not in CORE_DOCTYPES
+			and typed_semantics_v2_enabled()
+			and not frappe.flags.get("_typed_plan_building")
+		):
+			# Plan building reads meta, whose cold-cache load runs queries of its own;
+			# those nested queries must not recurse into plan building.
+			frappe.flags._typed_plan_building = True
+			try:
+				typed_plan = self._typed_normalization_plan()
+			finally:
+				frappe.flags._typed_plan_building = False
+			if typed_plan:
+				self.query._typed_plan = typed_plan
+
 		self.query.immutable = True
 		return self.query
+
+	def _typed_normalization_plan(self):
+		"""Typed-semantics-v2 read normalization plan, or None when nothing applies.
+
+		Only unaliased direct DocField projections of the queried doctype (pypika Field on
+		the main table, or `*`) are normalized; aliases, expressions, functions and
+		joined-table columns keep low-level driver values.
+		"""
+		try:
+			meta = frappe.get_meta(self.doctype)
+		except frappe.DoesNotExistError:
+			return None
+
+		fields_plan = []
+		star_map = None
+		main_table_sql = self.table.get_sql()
+		for idx, field in enumerate(getattr(self, "fields", [])):
+			if isinstance(field, Star):
+				star_map = {df.fieldname: df.fieldtype for df in meta.get("fields")}
+			elif (
+				isinstance(field, Field)
+				and not field.alias
+				and (field.table is None or field.table.get_sql() == main_table_sql)
+				and (df := meta.get_field(field.name))
+			):
+				fields_plan.append((idx, field.name, df.fieldtype))
+		if not fields_plan and star_map is None:
+			return None
+		return (fields_plan, star_map)
 
 	def apply_fields(self, fields):
 		self.fields = self.parse_fields(fields)

@@ -32,6 +32,7 @@ import frappe
 from frappe.database.database import CREATE_OR_DROP, Database, DatabaseCapability
 from frappe.database.postgres.schema import PostgresTable
 from frappe.database.utils import EmptyQueryValues, LazyDecode
+from frappe.types.typed_semantics import typed_semantics_v2_enabled
 from frappe.utils import cstr, get_table_name
 
 # cast decimals as floats
@@ -68,8 +69,10 @@ psycopg2.extensions.register_type(TIME2TIMEDELTA)
 # demand. A parsed value diverges from MariaDB and breaks round-tripping -- e.g. re-saving a doc
 # whose JSON field came back as a list fails get_valid_dict's "cannot be a list" check. Return the
 # raw text instead so both backends behave identically.
+# Registration must NOT be process-global: sites sharing one process can differ in the
+# typed_semantics_v2 switch, so get_connection() registers this per connection (off) or leaves
+# psycopg2's native dict/list decoding in place (on).
 JSON2STR = psycopg2.extensions.new_type((114, 3802), "JSON2STR", lambda value, cursor: value)
-psycopg2.extensions.register_type(JSON2STR)
 
 LOCATE_SUB_PATTERN = re.compile(r"locate\(([^,]+),([^)]+)(\)?)\)", flags=re.IGNORECASE)
 LOCATE_QUERY_PATTERN = re.compile(r"locate\(", flags=re.IGNORECASE)
@@ -298,6 +301,8 @@ class PostgresDatabase(PostgresExceptionUtil, Database):
 
 		conn = psycopg2.connect(**conn_settings)
 		conn.set_isolation_level(ISOLATION_LEVEL_REPEATABLE_READ)
+		if not typed_semantics_v2_enabled():
+			psycopg2.extensions.register_type(JSON2STR, conn)
 
 		return conn
 

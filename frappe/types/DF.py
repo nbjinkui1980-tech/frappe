@@ -1,6 +1,6 @@
 """This file defines all frappe types."""
 
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from typing import Literal
 
 # DocField types
@@ -23,7 +23,7 @@ Geolocation = Text
 HTMLEditor = Text
 Icon = Data
 Int = int
-JSON = Text
+JSON = dict | list | None
 Link = Data
 LongInt = int
 LongText = Text
@@ -37,6 +37,6 @@ Select = Literal
 Signature = Text
 SmallText = Text
 TextEditor = Text
-Time = str | time
+Time = str | time | timedelta
 Table = list
 TableMultiSelect = list

@@ -112,6 +112,7 @@ def get_commands():
 	from .site import commands as site_commands
 	from .testing import commands as testing_commands
 	from .translate import commands as translate_commands
+	from .typed_semantics import commands as typed_semantics_commands
 	from .utils import commands as utils_commands
 
 	clickable_link = "https://frappeframework.com/docs"
@@ -120,6 +121,7 @@ def get_commands():
 		+ site_commands
 		+ testing_commands
 		+ translate_commands
+		+ typed_semantics_commands
 		+ gettext_commands
 		+ microbenchmark_commands
 		+ utils_commands

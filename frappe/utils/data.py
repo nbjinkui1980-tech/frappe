@@ -29,6 +29,7 @@ import frappe
 from frappe.desk.utils import slug
 from frappe.locale import get_date_format, get_first_day_of_the_week, get_number_format, get_time_format
 from frappe.types.filter import Filters, FilterSignature, FilterTuple
+from frappe.types.typed_semantics import typed_semantics_v2_enabled
 from frappe.utils.deprecations import deprecated
 from frappe.utils.number_format import NUMBER_FORMAT_MAP, NumberFormat
 
@@ -1112,7 +1113,13 @@ def cast(fieldtype, value=None):
 			value = datetime.datetime(1, 1, 1)
 
 	elif fieldtype == "Time":
-		value = get_timedelta(value)
+		# v2 canonical read is `timedelta | None`; the legacy path maps empty to a zero
+		# duration via get_timedelta. The empty check must not match timedelta(0), which
+		# is a real value.
+		if typed_semantics_v2_enabled() and (value is None or value == ""):
+			value = None
+		else:
+			value = get_timedelta(value)
 
 	return value
 

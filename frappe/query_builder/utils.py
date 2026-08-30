@@ -9,6 +9,7 @@ from pypika.terms import PseudoColumn
 
 import frappe
 from frappe.query_builder.terms import NamedParameterWrapper
+from frappe.types.typed_semantics import normalize_docfield_value
 
 from .builder import Base, MariaDB, Postgres, SQLite
 
@@ -163,6 +164,7 @@ def execute_query(query, *args, **kwargs):
 	dt = query.__dict__.get("_doctype")
 	parent_dt = query.__dict__.get("_parent_doctype")
 	fields = query.__dict__.get("_fields_list", [])
+	typed_plan = query.__dict__.get("_typed_plan")
 	child_queries = query._child_queries
 	query, params = prepare_query(query)
 	result = frappe.local.db.sql(query, params, *args, **kwargs)  # nosemgrep
@@ -179,7 +181,53 @@ def execute_query(query, *args, **kwargs):
 			dt, fields, result, as_dict=as_dict, pluck=kwargs.get("pluck", False), parent_doctype=parent_dt
 		)
 
+	if isinstance(result, list | tuple) and result and typed_plan:
+		result = apply_typed_normalization(
+			typed_plan,
+			result,
+			as_dict=bool(kwargs.get("as_dict")),
+			pluck=kwargs.get("pluck", False),
+		)
+
 	return result
+
+
+def apply_typed_normalization(typed_plan, result, *, as_dict, pluck):
+	"""Apply a typed-semantics-v2 normalization plan (see Engine._typed_normalization_plan)."""
+	fields_plan, star_map = typed_plan
+
+	if pluck:
+		# pluck returns the first column as a flat list; only normalize when that column
+		# is itself a direct DocField projection.
+		if fields_plan and fields_plan[0][0] == 0:
+			fieldtype = fields_plan[0][2]
+			return [normalize_docfield_value(fieldtype, value) for value in result]
+		return result
+
+	if as_dict:
+		for row in result:
+			for _, name, fieldtype in fields_plan:
+				if name in row:
+					row[name] = normalize_docfield_value(fieldtype, row[name])
+			if star_map:
+				for key, value in row.items():
+					if (fieldtype := star_map.get(key)) is not None:
+						row[key] = normalize_docfield_value(fieldtype, value)
+		return result
+
+	if not fields_plan:
+		# `*` tuple rows have no reliable column mapping here; stay low-level.
+		return result
+	index_fieldtypes = {idx: fieldtype for idx, _, fieldtype in fields_plan}
+	normalized = [
+		type(row)(
+			normalize_docfield_value(index_fieldtypes[i], value) if i in index_fieldtypes else value
+			for i, value in enumerate(row)
+		)
+		for row in result
+	]
+	# Preserve both the outer result and each driver's actual row container type.
+	return tuple(normalized) if isinstance(result, tuple) else normalized
 
 
 def mask_child_query_fields(child_queries, result):

@@ -24,6 +24,7 @@ from frappe.model.dynamic_links import invalidate_distinct_link_doctypes
 from frappe.model.naming import set_new_name
 from frappe.model.utils.link_count import notify_link_count
 from frappe.modules import load_doctype_module
+from frappe.types.typed_semantics import typed_semantics_v2_enabled
 from frappe.utils import (
 	cached_property,
 	cast_fieldtype,
@@ -561,6 +562,7 @@ class BaseDocument:
 		field_values = self.__dict__
 		field_map = self.meta._fields
 		masked_fieldnames = self.flags.get("masked_fieldnames")
+		typed_v2 = typed_semantics_v2_enabled()
 
 		for fieldname in self.meta.get_valid_fields():
 			value = field_values.get(fieldname)
@@ -587,7 +589,11 @@ class BaseDocument:
 					value = self.get_virtual_field_value(df)
 
 				fieldtype = df.fieldtype
-				if isinstance(value, list) and fieldtype not in table_fields:
+				if (
+					isinstance(value, list)
+					and fieldtype not in table_fields
+					and not (typed_v2 and fieldtype == "JSON")
+				):
 					frappe.throw(_("Value for {0} cannot be a list").format(_(df.label, context=df.parent)))
 
 				if fieldtype == "Check":
@@ -596,7 +602,18 @@ class BaseDocument:
 				elif fieldtype == "Int" and not isinstance(value, int):
 					value = cint(value)
 
+				elif fieldtype == "JSON" and typed_v2:
+					if value == "":
+						value = None
+					elif isinstance(value, dict | list):
+						value = json.dumps(value, separators=(",", ":"))
+					elif value is not None:
+						frappe.throw(_("JSON value must be an object, array, or null"))
+
 				elif fieldtype == "JSON" and isinstance(value, dict):
+					# The wire value stays a JSON text literal on both backends (MariaDB longtext,
+					# postgres jsonb coercion of unknown-typed literals); v2 only widens the accepted
+					# python shapes so a natively decoded object can round-trip the write path.
 					value = json.dumps(value, separators=(",", ":"))
 
 				elif fieldtype in float_like_fields and not isinstance(value, float):
@@ -608,6 +625,9 @@ class BaseDocument:
 				elif (fieldtype in datetime_fields and value == "") or (
 					getattr(df, "unique", False) and cstr(value).strip() == ""
 				):
+					value = None
+
+				elif typed_v2 and fieldtype == "Link" and value == "":
 					value = None
 
 			if convert_dates_to_str and isinstance(value, DatetimeTypes):
