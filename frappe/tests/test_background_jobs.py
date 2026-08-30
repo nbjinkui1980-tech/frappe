@@ -75,6 +75,7 @@ class TestBackgroundJobs(IntegrationTestCase):
 		def method():
 			return "done"
 
+		self.addCleanup(delattr, frappe.local, "job")
 		with (
 			patch.object(
 				frappe,
