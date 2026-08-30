@@ -509,6 +509,13 @@ class TestProviderContract(UnitTestCase):
 			patch.object(migration, "lower_lock_timeout"),
 			patch.object(migration, "kill_idle_connections"),
 		):
-			migration.setUp()
+			try:
+				migration.setUp()
+			finally:
+				# setUp() flips process-global maintenance flags; UnitTestCase does
+				# not restore flags, so reset them here to keep this process clean
+				# for every test that runs after this one.
+				frappe.flags.in_migrate = False
+				frappe.flags.pop("touched_tables", None)
 
 		clear_cache.assert_called_once_with()
