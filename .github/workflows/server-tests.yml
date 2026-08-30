@@ -43,7 +43,7 @@ jobs:
         with:
           python-version: '3.14'
           node-version: 24
-          build-assets: false
+          build-assets: true
           disable-web: true
           disable-socketio: true
           db-root-password: ${{ env.DB_ROOT_PASSWORD }}
@@ -76,7 +76,7 @@ jobs:
         with:
           python-version: '3.14'
           node-version: 24
-          build-assets: false
+          build-assets: true
           disable-web: true
           disable-socketio: true
           db-root-password: ${{ env.DB_ROOT_PASSWORD }}
