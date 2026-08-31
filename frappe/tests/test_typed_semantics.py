@@ -1,6 +1,7 @@
 # Copyright (c) 2026, Frappe Technologies Pvt. Ltd. and Contributors
 # License: MIT. See LICENSE
 import datetime
+import json
 from unittest.mock import patch
 
 import frappe
@@ -631,3 +632,86 @@ class TestTypedSemanticsV2Integration(IntegrationTestCase):
 			second = apply_plan(plan)
 		self.assertTrue(second["updated_rows"])
 		self.assertTrue(all(n == 0 for n in second["updated_rows"].values()))
+
+
+class TestMaskedJsonV2Order(IntegrationTestCase):
+	MASKED_DOCTYPE = "Test Masked JSON v2"
+	TEST_USER = "test-masked-json-v2@example.com"
+
+	def _create_fixture(self):
+		if frappe.db.exists("DocType", self.MASKED_DOCTYPE):
+			frappe.delete_doc("DocType", self.MASKED_DOCTYPE, force=True, ignore_permissions=True)
+		if frappe.db.exists("User", self.TEST_USER):
+			frappe.delete_doc("User", self.TEST_USER, force=True, ignore_permissions=True)
+		self.addCleanup(self._delete_fixture)
+
+		frappe.get_doc(
+			{
+				"doctype": "User",
+				"email": self.TEST_USER,
+				"first_name": "Masked JSON Test",
+				"user_type": "Website User",
+			}
+		).insert(ignore_permissions=True)
+		frappe.get_doc(
+			{
+				"doctype": "DocType",
+				"name": self.MASKED_DOCTYPE,
+				"module": "Core",
+				"custom": 1,
+				"fields": [
+					{"fieldname": "title", "label": "Title", "fieldtype": "Data"},
+					{
+						"fieldname": "payload",
+						"label": "Payload",
+						"fieldtype": "JSON",
+						"mask": 1,
+						"permlevel": 1,
+					},
+				],
+				"permissions": [{"role": "All", "read": 1}, {"role": "All", "read": 1, "permlevel": 1}],
+			}
+		).insert(ignore_permissions=True)
+		frappe.get_doc({"doctype": self.MASKED_DOCTYPE, "title": "fixture", "payload": {"a": 1}}).insert(
+			ignore_permissions=True
+		)
+
+	def _delete_fixture(self):
+		frappe.set_user("Administrator")
+		if frappe.db.exists("DocType", self.MASKED_DOCTYPE):
+			frappe.delete_doc("DocType", self.MASKED_DOCTYPE, force=True, ignore_permissions=True)
+		if frappe.db.exists("User", self.TEST_USER):
+			frappe.delete_doc("User", self.TEST_USER, force=True, ignore_permissions=True)
+		frappe.db.commit()
+
+	def _as_object(self, value):
+		return json.loads(value) if isinstance(value, str) else value
+
+	def test_masked_json_direct_projection_returns_placeholder(self):
+		self._create_fixture()
+		with enable_v2(), self.set_user(self.TEST_USER):
+			row = frappe.get_list(self.MASKED_DOCTYPE, fields=["payload"])[0]
+		self.assertEqual(row.payload, "XXXXXXXX")
+
+	def test_authorized_json_direct_projection_returns_object(self):
+		self._create_fixture()
+		with enable_v2():
+			row = frappe.get_list(self.MASKED_DOCTYPE, fields=["payload"])[0]
+		self.assertEqual(row.payload, {"a": 1})
+
+	def test_aliased_json_projection_stays_low_level(self):
+		self._create_fixture()
+		with enable_v2():
+			row = frappe.get_list(self.MASKED_DOCTYPE, fields=["payload as aliased_payload"])[0]
+		if frappe.db.db_type == "mariadb":
+			self.assertIsInstance(row.aliased_payload, str)
+		self.assertEqual(self._as_object(row.aliased_payload), {"a": 1})
+
+	def test_switch_off_keeps_legacy_masked_behavior(self):
+		self._create_fixture()
+		with disable_v2(), self.set_user(self.TEST_USER):
+			row = frappe.get_list(self.MASKED_DOCTYPE, fields=["payload"])[0]
+		self.assertEqual(row.payload, "XXXXXXXX")
+		with disable_v2():
+			row = frappe.get_list(self.MASKED_DOCTYPE, fields=["payload"])[0]
+		self.assertEqual(self._as_object(row.payload), {"a": 1})

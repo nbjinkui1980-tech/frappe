@@ -174,19 +174,19 @@ def execute_query(query, *args, **kwargs):
 		if dt:
 			mask_child_query_fields(child_queries, result)
 
-	if result and dt and fields:
-		# `db.sql` returns tuples unless `as_dict` is passed, so masking must not assume dicts
-		as_dict = bool(kwargs.get("as_dict"))
-		result = mask_fields(
-			dt, fields, result, as_dict=as_dict, pluck=kwargs.get("pluck", False), parent_doctype=parent_dt
-		)
-
 	if isinstance(result, list | tuple) and result and typed_plan:
 		result = apply_typed_normalization(
 			typed_plan,
 			result,
 			as_dict=bool(kwargs.get("as_dict")),
 			pluck=kwargs.get("pluck", False),
+		)
+
+	if result and dt and fields:
+		# `db.sql` returns tuples unless `as_dict` is passed, so masking must not assume dicts
+		as_dict = bool(kwargs.get("as_dict"))
+		result = mask_fields(
+			dt, fields, result, as_dict=as_dict, pluck=kwargs.get("pluck", False), parent_doctype=parent_dt
 		)
 
 	return result
