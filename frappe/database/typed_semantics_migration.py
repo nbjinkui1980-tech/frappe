@@ -68,6 +68,8 @@ def _classify_fields() -> tuple[list, list, list]:
 		"DocType",
 		filters={"issingle": 0, "is_virtual": 0},
 		fields=["name", "module", "custom"],
+		# Stable classification order: verify_plan's surface comparison is order-sensitive.
+		order_by="name",
 	)
 	for doctype_row in doctypes:
 		doctype = doctype_row.name

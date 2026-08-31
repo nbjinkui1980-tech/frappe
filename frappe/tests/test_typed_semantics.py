@@ -292,6 +292,23 @@ class TestPlanClassification(UnitTestCase):
 			typed_semantics_migration._find_invalid_json_rows("Typed JSON", "tabTyped JSON", "payload")
 		self.assertIn("ORDER BY `name`", captured[0])
 
+	def test_classification_doctype_query_is_stably_ordered(self):
+		from frappe.database import typed_semantics_migration
+
+		captured = {}
+
+		def fake_get_all(doctype, **kwargs):
+			captured.update(kwargs)
+			return []
+
+		with (
+			patch.object(typed_semantics_migration, "_information_schema_columns", return_value={}),
+			patch.object(frappe, "get_all", side_effect=fake_get_all),
+			patch.object(frappe, "get_meta", return_value=self._meta([])),
+		):
+			typed_semantics_migration._classify_fields()
+		self.assertEqual(captured.get("order_by"), "name")
+
 
 class TestPlanIntegrity(UnitTestCase):
 	def test_missing_hash_rejected(self):
