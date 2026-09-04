@@ -240,9 +240,11 @@ def _canonical_patch_name(patchmodule: str) -> str:
 	if patchmodule.startswith("execute:"):
 		return patchmodule
 
-	module, separator, suffix = patchmodule.partition(" ")
-	module = frappe.resolve_dotted_path(module, surface="patch_log")
-	return f"{module}{separator}{suffix}"
+	# patch.txt lines may carry an inline comment after a space OR a tab; the alias resolver
+	# only accepts the bare dotted path, while the stored patch name keeps the original suffix.
+	module = patchmodule.split("#", 1)[0].split(maxsplit=1)[0]
+	resolved = frappe.resolve_dotted_path(module, surface="patch_log")
+	return resolved + patchmodule[len(module) :]
 
 
 def _patch_mode(enable):

@@ -104,6 +104,14 @@ class TestPatches(IntegrationTestCase):
 
 		frappe.flags.in_install = False
 
+	def test_canonical_patch_name_strips_space_and_tab_comments(self):
+		from frappe.modules.patch_handler import _canonical_patch_name
+
+		plain = "frappe.patches.v8_0.set_currency_field_precision"
+		self.assertEqual(_canonical_patch_name(f"{plain}\t# inline comment"), f"{plain}\t# inline comment")
+		self.assertEqual(_canonical_patch_name(f"{plain} # c"), f"{plain} # c")
+		self.assertEqual(_canonical_patch_name(plain), plain)
+
 	def test_get_patch_list(self):
 		pre = patch_handler.get_patches_from_app("frappe", patch_handler.PatchType.pre_model_sync)
 		post = patch_handler.get_patches_from_app("frappe", patch_handler.PatchType.post_model_sync)
